@@ -2,7 +2,7 @@
 
 <img src="frontend/static/favicon.svg" alt="ContractsPulse logo" width="80" height="80" />
 
-# ContractsPulse · Jaggaer Labs
+# ContractsPulse ·
 
 **AI contract intelligence — powered by Google Gemini.**
 
