@@ -38,6 +38,21 @@ Notes:
   analysis alive (FastAPI BackgroundTasks need CPU after the response returns).
 - Redis is intentionally absent — the app never uses it.
 
+## ⚠️ If Vercel says "bundle size exceeds 500 MB"
+
+That means Vercel tried to build the **backend** as a Python serverless
+function. Don't fight the limit — the backend cannot run on Vercel at all
+(FastAPI background analysis is killed after the response in serverless,
+and it needs persistent pgvector Postgres). Vercel must only build the
+frontend:
+
+- **Vercel dashboard**: Project → Settings → General → **Root Directory =
+  `frontend`** (then redeploy), or
+- **CLI**: `vercel --cwd frontend`
+
+Never import the repo root or a multi-service config that includes
+`backend/` as a Vercel service.
+
 ## 3. Frontend — Vercel
 
 1. Put the Cloud Run URL into `frontend/vercel.json` (replace

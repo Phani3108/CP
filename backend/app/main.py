@@ -9,13 +9,6 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, or_
 
-# OpenTelemetry Tracing Setup for Jaeger
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-
 # Security & JWT settings
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
@@ -67,12 +60,23 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return encoded_jwt
 
-resource = Resource.create({"service.name": "contractspulse-api"})
-provider = TracerProvider(resource=resource)
-endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4317")
-exporter = OTLPSpanExporter(endpoint=endpoint)
-provider.add_span_processor(BatchSpanProcessor(exporter))
-trace.set_tracer_provider(provider) 
+# Optional OpenTelemetry tracing — only when an OTLP endpoint is configured
+# AND the packages are installed (kept out of the default requirements to
+# keep the deploy bundle small; the app never instrumented spans anyway).
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+
+        provider = TracerProvider(resource=Resource.create({"service.name": "contractspulse-api"}))
+        provider.add_span_processor(BatchSpanProcessor(
+            OTLPSpanExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))))
+        trace.set_tracer_provider(provider)
+    except ImportError:
+        print("OTEL endpoint set but opentelemetry packages not installed; tracing disabled.")
 
 app = FastAPI(
     title="ContractsPulse API",
