@@ -765,9 +765,65 @@
 		}
 	});
 
+	// --- Template deviation (first-party paper) ---
+	let availableTemplates = $state<any[]>([]);
+	let selectedTemplateId = $state('');
+	let deviationStarting = $state(false);
+	const deviationData = $derived(contract?.metadata_json?.deviation_analysis || null);
+	const deviationStatus = $derived(contract?.metadata_json?.deviation_status || null);
+	const deviationItems = $derived(
+		((deviationData?.items || []) as any[]).filter((i) => i.deviation_type !== 'MATCHED')
+	);
+	const deviationMatched = $derived(
+		((deviationData?.items || []) as any[]).filter((i) => i.deviation_type === 'MATCHED')
+	);
+
+	async function loadTemplatesList() {
+		try {
+			const res = await apiFetch('/api/v1/templates');
+			if (res.ok) {
+				const d = await res.json();
+				availableTemplates = (d.templates || []).filter((t: any) => t.status === 'READY');
+				if (!selectedTemplateId && availableTemplates.length > 0) selectedTemplateId = availableTemplates[0].id;
+			}
+		} catch {
+			/* non-fatal */
+		}
+	}
+
+	async function startDeviationAnalysis() {
+		if (!selectedTemplateId || deviationStarting) return;
+		deviationStarting = true;
+		try {
+			const res = await apiFetch(`/api/v1/contracts/${contractId}/analyze-deviations`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ template_id: selectedTemplateId })
+			});
+			const j = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(j?.detail || 'Failed to start deviation analysis');
+			toast.success('Deviation analysis started');
+			await fetchContractDetails(true);
+		} catch (e: any) {
+			toast.error(e?.message || 'Failed to start deviation analysis');
+		} finally {
+			deviationStarting = false;
+		}
+	}
+
+	function copyRestoreLanguage(item: any) {
+		const textToCopy = item.suggested_language_to_restore_standard || item.template_text || '';
+		navigator.clipboard.writeText(textToCopy);
+		toast.success('Standard language copied to clipboard');
+	}
+
+	$effect(() => {
+		if (activeTab === 'deviation') loadTemplatesList();
+	});
+
 	onMount(() => {
 		loadVersionChain();
-		
+
 		// Parse query parameters for deep linking
 		const params = new URL(window.location.href).searchParams;
 		const tabParam = params.get('tab');
@@ -776,10 +832,10 @@
 		if (searchParam) clauseSearchQuery = searchParam;
 		const riskParam = params.get('risk');
 		if (riskParam) clauseRiskFilter = riskParam.toUpperCase();
-		
-		// Auto-poll if it's processing
+
+		// Auto-poll while analysis or deviation runs in the background
 		pollInterval = setInterval(() => {
-			if (contract && contract.status === 'PROCESSING') {
+			if (contract && (contract.status === 'PROCESSING' || contract.metadata_json?.deviation_status === 'RUNNING')) {
 				fetchContractDetails(true);
 			}
 		}, 3000);
@@ -972,6 +1028,13 @@
 							Redline Verification
 						</button>
 					{/if}
+					<button role="tab" aria-selected={activeTab === 'deviation'} class="tab-btn" class:active={activeTab === 'deviation'} onclick={() => activeTab = 'deviation'}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5"/><path d="M8 21H3v-5"/><path d="M21 3l-7.5 7.5"/><path d="M3 21l7.5-7.5"/></svg>
+						Template Deviation
+						{#if deviationData?.summary?.off_playbook}
+							<span class="badge badge-danger badge-sm" style="margin-left: 4px;">{deviationData.summary.off_playbook}</span>
+						{/if}
+					</button>
 				{/if}
 				{#if contract.status === 'PROCESSING'}
 					<button role="tab" aria-selected={activeTab === 'trace'} class="tab-btn" class:active={activeTab === 'trace'} onclick={() => activeTab = 'trace'}>
@@ -1321,6 +1384,9 @@
 										<button class="suggestion-pill" onclick={() => { chatInput = 'Are there any auto-renewal terms or opt-out deadlines?'; sendChat(); }}>Auto-renewal</button>
 										<button class="suggestion-pill" onclick={() => { chatInput = 'Summarize key vendor obligations and our obligations.'; sendChat(); }}>Obligations summary</button>
 										<button class="suggestion-pill" onclick={() => { chatInput = 'What is the limitation of liability and are there any carve-outs?'; sendChat(); }}>Liability caps</button>
+										{#if deviationData}
+											<button class="suggestion-pill" onclick={() => { chatInput = 'What changed versus our standard template, and which deviations should we escalate?'; sendChat(); }}>Template deviations</button>
+										{/if}
 									</div>
 								</div>
 							{:else}
@@ -1563,6 +1629,180 @@
 								</div>
 							{/each}
 						</div>
+					</div>
+				{/if}
+
+				<!-- TEMPLATE DEVIATION TAB (first-party paper) -->
+				{#if activeTab === 'deviation' && contract.status === 'COMPLETED'}
+					<div class="tab-content flex-col gap-24">
+						{#if deviationStatus === 'RUNNING'}
+							<div class="dev-picker-card bg-panel-glow">
+								<div class="flex-row gap-12">
+									<span class="spinner spinner-lg"></span>
+									<div>
+										<h3 class="subsection-title" style="margin: 0;">Analyzing deviations from standard…</h3>
+										<p class="text-tertiary font-size-12" style="margin: 4px 0 0 0;">{contract.metadata_json?.processing_step || 'Aligning clauses against the standard template…'}</p>
+									</div>
+								</div>
+							</div>
+						{:else if !deviationData}
+							<div class="dev-picker-card bg-panel-glow">
+								<h3 class="subsection-title" style="margin: 0 0 6px 0;">Check this contract against your standard paper</h3>
+								<p class="text-tertiary font-size-12" style="margin: 0 0 14px 0;">
+									Pick the approved template this contract was authored from. ContractsPulse aligns every clause,
+									then flags what the counterparty <strong>modified</strong>, <strong>added</strong>, or <strong>deleted</strong> — and scores the risk of each change.
+								</p>
+								{#if availableTemplates.length === 0}
+									<div class="empty-card">
+										No ready templates yet. <a href="/templates" style="color: var(--accent-primary);">Create one in Templates</a> from your standard paper first.
+									</div>
+								{:else}
+									<div class="dev-picker-row">
+										<select class="dev-select" bind:value={selectedTemplateId} aria-label="Select standard template">
+											{#each availableTemplates as t (t.id)}
+												<option value={t.id}>{t.name} ({t.clause_count} clauses)</option>
+											{/each}
+										</select>
+										<button type="button" class="btn btn-primary" disabled={deviationStarting || !selectedTemplateId} onclick={startDeviationAnalysis}>
+											{#if deviationStarting}<span class="spinner spinner-sm" style="border-top-color:#fff;"></span>{:else}Analyze deviations{/if}
+										</button>
+									</div>
+								{/if}
+								{#if deviationStatus === 'FAILED'}
+									<div class="text-danger font-size-12" style="margin-top: 10px;">The last deviation analysis failed — try again.</div>
+								{/if}
+							</div>
+						{:else}
+							<div class="verification-header bg-panel-glow">
+								<div class="vh-left">
+									<svg class="verify-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5"/><path d="M8 21H3v-5"/><path d="M21 3l-7.5 7.5"/><path d="M3 21l7.5-7.5"/></svg>
+									<div>
+										<h3 class="subsection-title" style="margin: 0;">Deviation vs “{deviationData.template_name}”</h3>
+										<p class="text-tertiary font-size-12" style="margin: 4px 0 0 0;">
+											First-party paper audit — what the counterparty changed on our standard, and the risk of each change.
+										</p>
+									</div>
+								</div>
+								<div class="vh-right">
+									<div class="vh-stats">
+										<div class="vstat-badge danger">
+											<span class="vstat-num">{deviationData.summary?.deleted ?? 0}</span>
+											<span class="vstat-label">Deleted</span>
+										</div>
+										<div class="vstat-badge warning">
+											<span class="vstat-num">{deviationData.summary?.added ?? 0}</span>
+											<span class="vstat-label">Added</span>
+										</div>
+										<div class="vstat-badge warning">
+											<span class="vstat-num">{deviationData.summary?.off_playbook ?? 0}</span>
+											<span class="vstat-label">Off-standard</span>
+										</div>
+										<div class="vstat-badge success">
+											<span class="vstat-num">{deviationData.summary?.standard ?? 0}</span>
+											<span class="vstat-label">On-standard</span>
+										</div>
+									</div>
+								</div>
+							</div>
+
+							<div class="resolutions-list flex-col gap-16">
+								{#each deviationItems as item, di (di)}
+									<div class="resolution-card bg-panel-glow dev-card dev-{item.deviation_type.toLowerCase()}">
+										<div class="rc-header">
+											<div class="rc-header-left">
+												<span class="dev-kind-tag dev-kind-{item.deviation_type.toLowerCase()}">
+													{item.deviation_type === 'DELETED' ? 'DELETED FROM OUR PAPER' : item.deviation_type === 'ADDED' ? 'INSERTED BY COUNTERPARTY' : 'MODIFIED'}
+												</span>
+												<span class="clause-type-tag">{item.clause_type}</span>
+												{#if item.alignment_score != null}
+													<span class="badge badge-secondary badge-sm" title="Embedding similarity to standard">{Math.round(item.alignment_score * 100)}% similar</span>
+												{/if}
+											</div>
+											<div class="flex-row gap-8">
+												{#if item.escalate}
+													<span class="badge badge-danger">Escalate to Legal</span>
+												{/if}
+												<span class="badge {item.risk_of_change === 'CRITICAL' || item.risk_of_change === 'HIGH' ? 'badge-danger' : item.risk_of_change === 'MEDIUM' ? 'badge-warning' : 'badge-success'}">
+													{item.risk_of_change} risk of change
+												</span>
+											</div>
+										</div>
+
+										<div class="rc-comparison-grid">
+											<div class="pane pane-original">
+												<div class="pane-label">Our Standard</div>
+												{#if item.template_text}
+													<div class="pane-content" class:text-strikethrough={item.deviation_type === 'DELETED'}>{item.template_text}</div>
+												{:else}
+													<div class="dev-absent">Not in our standard template</div>
+												{/if}
+											</div>
+											<div class="pane pane-revised">
+												<div class="pane-label">Counterparty Version</div>
+												{#if item.deviation_type === 'DELETED'}
+													<div class="dev-removed">
+														<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+														REMOVED BY COUNTERPARTY
+														<span class="dev-removed-sub">This protection no longer exists in the incoming contract.</span>
+													</div>
+												{:else}
+													<div class="pane-content highlight-revised">{item.contract_text}</div>
+												{/if}
+											</div>
+										</div>
+
+										<div class="rc-explanation bg-active">
+											<div class="ex-header">
+												<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+												<span>AI Senior Counsel Verdict:</span>
+												<span class="badge {item.playbook_verdict === 'STANDARD' ? 'badge-success' : 'badge-warning'} badge-sm">{item.playbook_verdict === 'STANDARD' ? 'On-standard' : 'Off-standard'}</span>
+												<span class="badge badge-secondary badge-sm">{item.materiality}</span>
+												{#if item.direction === 'MORE_FAVORABLE_TO_COUNTERPARTY'}
+													<span class="badge badge-danger badge-sm">Favors counterparty</span>
+												{:else if item.direction === 'MORE_FAVORABLE_TO_US'}
+													<span class="badge badge-success badge-sm">Favors us</span>
+												{/if}
+											</div>
+											<p class="ex-body">{item.rationale}</p>
+											{#if item.absolute_risk?.risk_reasoning}
+												<p class="ex-body text-tertiary" style="margin-top: 6px;">Standalone risk review: {item.absolute_risk.risk_reasoning}</p>
+											{/if}
+											{#if item.suggested_language_to_restore_standard}
+												<div class="redline-rec bg-hover" style="margin-top: 10px;">
+													<div class="rr-label">{item.deviation_type === 'DELETED' ? 'Re-insert standard language:' : 'Restore-to-standard language:'}</div>
+													<div class="rr-text">{item.suggested_language_to_restore_standard}</div>
+												</div>
+												<button type="button" class="btn btn-secondary btn-compact" style="margin-top: 8px;" onclick={() => copyRestoreLanguage(item)}>
+													Copy standard language
+												</button>
+											{/if}
+										</div>
+									</div>
+								{:else}
+									<div class="empty-state bg-panel-glow">
+										<p class="text-secondary" style="margin-top: 8px;">No deviations — the contract matches your standard paper.</p>
+									</div>
+								{/each}
+
+								{#if deviationMatched.length > 0}
+									<div class="dev-matched-note">
+										✓ {deviationMatched.length} clauses match the standard template and were not flagged.
+									</div>
+								{/if}
+								<div class="dev-rerun-row">
+									{#if availableTemplates.length > 0}
+										<select class="dev-select" bind:value={selectedTemplateId} aria-label="Select standard template">
+											{#each availableTemplates as t (t.id)}
+												<option value={t.id}>{t.name}</option>
+											{/each}
+										</select>
+									{/if}
+									<button type="button" class="btn btn-secondary btn-compact" disabled={deviationStarting} onclick={startDeviationAnalysis}>
+										Re-run analysis
+									</button>
+								</div>
+							</div>
+						{/if}
 					</div>
 				{/if}
 			</div>
@@ -3837,5 +4077,117 @@
 	@keyframes spin {
 		from { transform: rotate(0deg); }
 		to { transform: rotate(360deg); }
+	}
+
+	/* ------------------------------------------------------------
+	   Template Deviation tab (first-party paper)
+	   ------------------------------------------------------------- */
+	.dev-picker-card {
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-lg);
+		padding: 20px;
+		background: var(--bg-panel);
+	}
+	.dev-picker-row {
+		display: flex;
+		gap: 10px;
+		align-items: center;
+		flex-wrap: wrap;
+	}
+	.dev-select {
+		flex: 1;
+		min-width: 220px;
+		height: 36px;
+		padding: 0 12px;
+		border-radius: var(--radius-md);
+		border: 1.5px solid var(--border-subtle);
+		background: var(--bg-hover);
+		color: var(--text-primary);
+		font-size: 13px;
+		outline: none;
+	}
+	.dev-select:focus {
+		border-color: var(--accent-primary);
+		background: #fff;
+		box-shadow: var(--ring);
+	}
+	.dev-kind-tag {
+		display: inline-flex;
+		align-items: center;
+		padding: 2px 10px;
+		border-radius: 999px;
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+	}
+	.dev-kind-deleted {
+		background: rgba(var(--color-critical-rgb), 0.12);
+		color: var(--color-critical-text);
+		border: 1px solid rgba(var(--color-critical-rgb), 0.3);
+	}
+	.dev-kind-added {
+		background: rgba(var(--color-high-rgb), 0.12);
+		color: var(--color-high-text);
+		border: 1px solid rgba(var(--color-high-rgb), 0.3);
+	}
+	.dev-kind-modified {
+		background: rgba(var(--accent-primary-rgb), 0.1);
+		color: var(--accent-primary);
+		border: 1px solid rgba(var(--accent-primary-rgb), 0.25);
+	}
+	.dev-card.dev-deleted {
+		border-color: rgba(var(--color-critical-rgb), 0.35);
+		box-shadow: 0 4px 24px rgba(var(--color-critical-rgb), 0.08);
+	}
+	.dev-removed {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 6px;
+		min-height: 120px;
+		height: 100%;
+		border: 1.5px dashed rgba(var(--color-critical-rgb), 0.45);
+		border-radius: 10px;
+		background: rgba(var(--color-critical-rgb), 0.05);
+		color: var(--color-critical-text);
+		font-weight: 700;
+		font-size: 12px;
+		letter-spacing: 0.05em;
+		text-align: center;
+		padding: 16px;
+	}
+	.dev-removed-sub {
+		font-weight: 400;
+		font-size: 11.5px;
+		letter-spacing: 0;
+		color: var(--text-secondary);
+	}
+	.dev-absent {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 120px;
+		height: 100%;
+		border: 1.5px dashed var(--border-strong);
+		border-radius: 10px;
+		color: var(--text-tertiary);
+		font-size: 12px;
+		padding: 16px;
+		text-align: center;
+	}
+	.dev-matched-note {
+		color: var(--color-low-text);
+		font-size: 12.5px;
+		padding: 10px 14px;
+		background: rgba(var(--color-low-rgb), 0.07);
+		border: 1px solid rgba(var(--color-low-rgb), 0.2);
+		border-radius: 10px;
+	}
+	.dev-rerun-row {
+		display: flex;
+		gap: 10px;
+		align-items: center;
+		padding-top: 4px;
 	}
 </style>

@@ -17,4 +17,5 @@ COPY . .
 RUN useradd -U -u 1000 appuser && chown -R 1000:1000 /app
 USER 1000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9432"]
+# Cloud Run injects $PORT; default to 9432 for local/compose usage.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-9432}"]

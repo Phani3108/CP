@@ -607,3 +607,262 @@ def _heuristic_verify_redline(parent_text: str, parent_redline: str, new_text: s
     else:
         return "UNRESOLVED", "HIGH", "The clause was modified but did not adopt any of the protective terms recommended in the redline suggestion."
 
+
+
+# ---------------------------------------------------------
+# Agent 5: Template Deviation Analyst (first-party paper)
+# Compares a counterparty-edited clause against OUR approved
+# standard template clause and scores the risk of the CHANGE.
+# ---------------------------------------------------------
+
+class DeviationAnalysis(BaseModel):
+    deviation_type: str = Field(description="Must be exactly one of: MODIFIED, ADDED, DELETED")
+    materiality: str = Field(description="Must be exactly one of: COSMETIC, IMMATERIAL, MATERIAL. COSMETIC = formatting/numbering/defined-term casing/non-substantive rewording only.")
+    direction: str = Field(description="Must be exactly one of: MORE_FAVORABLE_TO_COUNTERPARTY, MORE_FAVORABLE_TO_US, NEUTRAL — judged from the template owner's perspective.")
+    playbook_verdict: str = Field(description="Must be exactly: STANDARD (equivalent to our approved language) or OFF_PLAYBOOK (materially departs from it).")
+    risk_of_change: str = Field(description="Must be exactly one of: LOW, MEDIUM, HIGH, CRITICAL — the MARGINAL risk introduced by the change versus our standard, not the absolute risk of the clause.")
+    suggested_language_to_restore_standard: str | None = Field(default=None, description="If OFF_PLAYBOOK or MATERIAL against us: clean professional replacement language to restore/protect our position.")
+    rationale: str = Field(description="ONE sentence in plain English a non-lawyer can paste into a negotiation email explaining why this matters.")
+    escalate: bool = Field(default=False, description="True when the deviation is OFF_PLAYBOOK and MATERIAL against us and should be escalated to legal.")
+
+
+deviation_agent = Agent(
+    os.getenv("OPENAI_MODEL_RISK", "openai:gpt-4.1"),
+    output_type=DeviationAnalysis,
+    retries=3,
+    system_prompt=(
+        "You are a Senior Legal Counsel reviewing a counterparty's edits to our company's OWN "
+        "pre-approved standard contract template ('first-party paper'). The STANDARD language was "
+        "already vetted and approved — do not re-litigate it; evaluate only the DEVIATION. "
+        "Given (a) our standard template clause and (b) the counterparty's version — or a note that "
+        "the clause was deleted or newly inserted — determine: "
+        "(1) materiality: COSMETIC (formatting, numbering, defined-term casing, non-substantive "
+        "rewording) vs IMMATERIAL (substantive wording but no real shift in position) vs MATERIAL "
+        "(shifts a right, obligation, cap, deadline, scope, or risk allocation); "
+        "(2) direction: does the change move risk/benefit toward us or toward the counterparty, "
+        "judged from OUR perspective as the template owner; "
+        "(3) playbook_verdict: STANDARD if effectively equivalent to our approved language, "
+        "OFF_PLAYBOOK if it materially departs from it; "
+        "(4) risk_of_change: the MARGINAL risk introduced by this change relative to our standard "
+        "(a cosmetic change MUST be LOW and STANDARD); "
+        "(5) if OFF_PLAYBOOK or MATERIAL against us, provide suggested_language_to_restore_standard "
+        "in clean professional legal language (for deletions, propose re-inserting the standard clause); "
+        "(6) a ONE-sentence plain-English rationale a non-lawyer can paste into a negotiation email; "
+        "(7) escalate=true only when OFF_PLAYBOOK and MATERIAL against us. "
+        "Be objective, concise, and specific about exactly what changed."
+    )
+)
+
+
+def _heuristic_deviation(kind: str, score: float, template_text: str, contract_text: str) -> DeviationAnalysis:
+    """Deterministic fallback when the LLM is unavailable — bands on alignment score."""
+    if kind == "DELETED":
+        return DeviationAnalysis(
+            deviation_type="DELETED",
+            materiality="MATERIAL",
+            direction="MORE_FAVORABLE_TO_COUNTERPARTY",
+            playbook_verdict="OFF_PLAYBOOK",
+            risk_of_change="HIGH",
+            suggested_language_to_restore_standard=(template_text or "")[:2000] or None,
+            rationale="A protection that exists in our approved standard template is absent from this contract and should be restored.",
+            escalate=True,
+        )
+    if kind == "ADDED":
+        return DeviationAnalysis(
+            deviation_type="ADDED",
+            materiality="MATERIAL",
+            direction="MORE_FAVORABLE_TO_COUNTERPARTY",
+            playbook_verdict="OFF_PLAYBOOK",
+            risk_of_change="MEDIUM",
+            suggested_language_to_restore_standard=None,
+            rationale="This clause does not exist in our approved standard template and needs review before acceptance.",
+            escalate=False,
+        )
+    # MODIFIED — band by how far it drifted
+    if score >= 0.85:
+        level, mat, verdict, esc = "LOW", "IMMATERIAL", "STANDARD", False
+        why = "The clause is close to our approved standard language with only minor wording drift."
+    elif score >= 0.72:
+        level, mat, verdict, esc = "MEDIUM", "MATERIAL", "OFF_PLAYBOOK", False
+        why = "The clause noticeably departs from our approved standard language and should be reviewed."
+    else:
+        level, mat, verdict, esc = "HIGH", "MATERIAL", "OFF_PLAYBOOK", True
+        why = "The clause has been substantially rewritten from our approved standard language."
+    return DeviationAnalysis(
+        deviation_type="MODIFIED",
+        materiality=mat,
+        direction="NEUTRAL",
+        playbook_verdict=verdict,
+        risk_of_change=level,
+        suggested_language_to_restore_standard=(template_text or "")[:2000] if verdict == "OFF_PLAYBOOK" else None,
+        rationale=why,
+        escalate=esc,
+    )
+
+
+def _deviation_item(kind, analysis: DeviationAnalysis, template_clause=None, contract_clause=None,
+                    score: float | None = None, type_mismatch: bool = False, absolute_risk: dict | None = None) -> dict:
+    clause_type = (
+        getattr(contract_clause, "clause_type", None)
+        or getattr(template_clause, "clause_type", None)
+        or "Clause"
+    )
+    return {
+        "clause_type": clause_type,
+        "deviation_type": kind,
+        "template_clause_id": str(template_clause.id) if template_clause is not None and getattr(template_clause, "id", None) else None,
+        "template_text": (getattr(template_clause, "text_content", None) or None),
+        "contract_clause_id": str(contract_clause.id) if contract_clause is not None and getattr(contract_clause, "id", None) else None,
+        "contract_text": (getattr(contract_clause, "text_content", None) or None),
+        "alignment_score": score,
+        "type_mismatch": type_mismatch,
+        "materiality": analysis.materiality,
+        "direction": analysis.direction,
+        "playbook_verdict": analysis.playbook_verdict,
+        "risk_of_change": analysis.risk_of_change,
+        "suggested_language_to_restore_standard": analysis.suggested_language_to_restore_standard,
+        "rationale": analysis.rationale,
+        "escalate": analysis.escalate,
+        "absolute_risk": absolute_risk,
+    }
+
+
+async def analyze_template_deviations(alignment, use_llm: bool = True, status_callback=None) -> list[dict]:
+    """Turn an AlignmentResult into scored DeviationItems.
+
+    MATCHED   -> STANDARD/LOW without any LLM call.
+    MODIFIED  -> deviation_agent (template vs counterparty text).
+    DELETED   -> deviation_agent deletion branch (risk of losing the protection).
+    ADDED     -> existing absolute risk_agent (clause is not in the vetted template).
+    Any LLM failure degrades to the deterministic heuristic for that item.
+    """
+    import asyncio
+
+    items: list[dict] = []
+
+    for pair in alignment.matched:
+        analysis = DeviationAnalysis(
+            deviation_type="MODIFIED",
+            materiality="COSMETIC",
+            direction="NEUTRAL",
+            playbook_verdict="STANDARD",
+            risk_of_change="LOW",
+            suggested_language_to_restore_standard=None,
+            rationale="Matches our approved standard template language.",
+            escalate=False,
+        )
+        items.append(_deviation_item("MATCHED", analysis, pair.template_clause, pair.contract_clause,
+                                     pair.score, pair.type_mismatch))
+
+    sem = asyncio.Semaphore(4)
+    total_llm = len(alignment.modified) + len(alignment.deleted) + len(alignment.added)
+    done_count = 0
+
+    async def report_progress():
+        nonlocal done_count
+        done_count += 1
+        if status_callback:
+            await status_callback(f"Evaluating deviations from standard template: {done_count} of {total_llm}...")
+
+    async def run_modified(pair):
+        async with sem:
+            t_text = (pair.template_clause.text_content or "")[:4000]
+            c_text = (pair.contract_clause.text_content or "")[:4000]
+            fragment_note = (
+                "\n\nNOTE: clause segmentation differs between the two documents — the counterparty "
+                "version may be a FRAGMENT of the standard clause (or vice versa). Judge only the "
+                "substantive drift in the language both versions actually cover; text present in the "
+                "standard but outside this fragment's scope is NOT a deletion."
+                if getattr(pair, "fragment", False) else ""
+            )
+            analysis = None
+            if use_llm:
+                try:
+                    run = await deviation_agent.run(
+                        f"Clause Type: {pair.template_clause.clause_type}\n"
+                        f"Embedding similarity to standard: {pair.score}\n\n"
+                        f"OUR STANDARD TEMPLATE CLAUSE:\n{t_text}\n\n"
+                        f"COUNTERPARTY'S VERSION IN THE INCOMING CONTRACT:\n{c_text}"
+                        f"{fragment_note}"
+                    )
+                    analysis = run.output
+                    analysis.deviation_type = "MODIFIED"
+                except Exception as e:
+                    print(f"Deviation agent failed (MODIFIED, {pair.template_clause.clause_type}): {e}")
+            if analysis is None:
+                analysis = _heuristic_deviation("MODIFIED", pair.score, t_text, c_text)
+            await report_progress()
+            return _deviation_item("MODIFIED", analysis, pair.template_clause, pair.contract_clause,
+                                   pair.score, pair.type_mismatch)
+
+    async def run_deleted(t_clause):
+        async with sem:
+            t_text = (t_clause.text_content or "")[:4000]
+            analysis = None
+            if use_llm:
+                try:
+                    run = await deviation_agent.run(
+                        f"Clause Type: {t_clause.clause_type}\n\n"
+                        f"OUR STANDARD TEMPLATE CLAUSE:\n{t_text}\n\n"
+                        "COUNTERPARTY'S VERSION: This clause is ENTIRELY ABSENT from the counterparty's "
+                        "contract — no clause in the incoming document covers this subject matter. "
+                        "First identify WHO this clause binds and WHO it protects. If it protects US "
+                        "(the template owner) or binds the counterparty, its deletion is "
+                        "MORE_FAVORABLE_TO_COUNTERPARTY and at least MEDIUM risk_of_change. "
+                        "Assess the risk of LOSING this protection (deviation_type=DELETED) and propose "
+                        "re-insertion language."
+                    )
+                    analysis = run.output
+                    analysis.deviation_type = "DELETED"
+                    if not (analysis.suggested_language_to_restore_standard or "").strip():
+                        analysis.suggested_language_to_restore_standard = t_text[:2000]
+                except Exception as e:
+                    print(f"Deviation agent failed (DELETED, {t_clause.clause_type}): {e}")
+            if analysis is None:
+                analysis = _heuristic_deviation("DELETED", 0.0, t_text, "")
+            await report_progress()
+            return _deviation_item("DELETED", analysis, t_clause, None, None, False)
+
+    async def run_added(c_clause):
+        async with sem:
+            c_text = (c_clause.text_content or "")[:4000]
+            absolute = None
+            analysis = None
+            if use_llm:
+                try:
+                    risk_run = await risk_agent.run(f"Clause Type: {c_clause.clause_type}\nText: {c_text}")
+                    rr: RiskAnalysisResult = risk_run.output
+                    absolute = {
+                        "risk_level": rr.risk_level,
+                        "risk_reasoning": rr.risk_reasoning,
+                        "redline_suggestion": rr.redline_suggestion,
+                    }
+                    analysis = DeviationAnalysis(
+                        deviation_type="ADDED",
+                        materiality="MATERIAL",
+                        direction="MORE_FAVORABLE_TO_COUNTERPARTY" if rr.risk_level in {"HIGH", "CRITICAL"} else "NEUTRAL",
+                        playbook_verdict="OFF_PLAYBOOK",
+                        risk_of_change=rr.risk_level,
+                        suggested_language_to_restore_standard=rr.redline_suggestion,
+                        rationale=_first_sentence(rr.risk_reasoning or "Counterparty-inserted clause not present in our approved template."),
+                        escalate=rr.risk_level in {"HIGH", "CRITICAL"},
+                    )
+                except Exception as e:
+                    print(f"Risk agent failed (ADDED, {c_clause.clause_type}): {e}")
+            if analysis is None:
+                analysis = _heuristic_deviation("ADDED", 0.0, "", c_text)
+            await report_progress()
+            return _deviation_item("ADDED", analysis, None, c_clause, None, False, absolute)
+
+    tasks = (
+        [run_modified(p) for p in alignment.modified]
+        + [run_deleted(t) for t in alignment.deleted]
+        + [run_added(c) for c in alignment.added]
+    )
+    if tasks:
+        items.extend(await asyncio.gather(*tasks))
+
+    severity = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    kind_weight = {"DELETED": 3, "ADDED": 2, "MODIFIED": 1, "MATCHED": 0}
+    items.sort(key=lambda i: (severity.get(i["risk_of_change"], 0), kind_weight.get(i["deviation_type"], 0)), reverse=True)
+    return items

@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, D
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 # OpenTelemetry Tracing Setup for Jaeger
 from opentelemetry import trace
@@ -103,7 +103,7 @@ async def health_check():
 from .parser import extract_text_from_pdf, extract_contract_metadata, standardized_filename, compute_text_hash
 from .agents import process_contract_text, process_contract_text_fallback, _heuristic_redline, _first_sentence, _heuristic_risk, _enrich_ip_clause, verify_previous_redlines, extract_contract_obligations
 from .database import engine, Base, get_db
-from .models import User, Contract, ContractClause, ContractStatus, RiskLevel, ContractEvent, ClauseFeedback, ContractReminder, ContractTemplate
+from .models import User, Contract, ContractClause, ContractStatus, RiskLevel, ContractEvent, ClauseFeedback, ContractReminder, ContractTemplate, TemplateClause
 
 def get_current_user(
     authorization: str | None = Header(None),
@@ -242,17 +242,41 @@ async def create_contract_from_text(
 async def startup_event():
     with engine.begin() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-    
+
+    # Create all model tables FIRST — on a truly fresh database the ALTER
+    # fix-ups below would otherwise fail with "relation does not exist".
+    Base.metadata.create_all(bind=engine)
+
     # Remove unique index constraint on contracts.file_hash if it exists to allow per-user duplicate uploads
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE contracts DROP CONSTRAINT IF EXISTS uq_contracts_file_hash;"))
         conn.execute(text("DROP INDEX IF EXISTS ix_contracts_file_hash;"))
-        
-    Base.metadata.create_all(bind=engine)
-    
-    # Re-create index as non-unique
-    with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_contracts_file_hash ON contracts(file_hash);"))
+
+    # Contract deletion must cascade to events/feedback. The models predate
+    # ON DELETE CASCADE on these FKs, so re-create them idempotently.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE contract_events DROP CONSTRAINT IF EXISTS contract_events_contract_id_fkey;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE contract_events ADD CONSTRAINT contract_events_contract_id_fkey "
+            "FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE clause_feedback DROP CONSTRAINT IF EXISTS clause_feedback_contract_id_fkey;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE clause_feedback ADD CONSTRAINT clause_feedback_contract_id_fkey "
+            "FOREIGN KEY (contract_id) REFERENCES contracts(id) ON DELETE CASCADE;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE clause_feedback DROP CONSTRAINT IF EXISTS clause_feedback_clause_id_fkey;"
+        ))
+        conn.execute(text(
+            "ALTER TABLE clause_feedback ADD CONSTRAINT clause_feedback_clause_id_fkey "
+            "FOREIGN KEY (clause_id) REFERENCES contract_clauses(id) ON DELETE CASCADE;"
+        ))
         
     # Lightweight schema catch-up for additive columns (demo-friendly; avoids migrations).
     with engine.begin() as conn:
@@ -319,6 +343,20 @@ async def startup_event():
             ");"
         ))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_contract_templates_user_created ON contract_templates(user_id, created_at);"))
+        # Additive: template pipeline status + segmented template clauses
+        conn.execute(text("ALTER TABLE contract_templates ADD COLUMN IF NOT EXISTS status text DEFAULT 'PENDING';"))
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS template_clauses ("
+            "  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), "
+            "  template_id uuid NOT NULL REFERENCES contract_templates(id) ON DELETE CASCADE, "
+            "  clause_type text, "
+            "  text_content text NOT NULL, "
+            "  position_index int DEFAULT 0, "
+            "  embedding vector(1536), "
+            "  created_at timestamptz NOT NULL DEFAULT now() "
+            ");"
+        ))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_template_clauses_template ON template_clauses(template_id);"))
 
     # New feature: ensure contracts metadata can store expiry/obligations (stored in JSONB, no schema change needed)
     # No additional columns needed - all stored in metadata_json JSONB
@@ -467,8 +505,23 @@ async def _run_analysis_pipeline(contract_id: str, raw_text: str, update_status)
     return analysis_results, analysis_meta
 
 
+async def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batch-embed texts with the configured model/dimensions (shared by
+    contract clauses and template clauses)."""
+    import openai
+    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    out: list[list[float]] = []
+    for i in range(0, len(texts), 100):
+        chunk = texts[i:i + 100]
+        res = await client.embeddings.create(
+            model=_openai_embedding_model(), dimensions=_embedding_dimensions(),
+            input=chunk
+        )
+        out.extend([item.embedding for item in res.data])
+    return out
+
+
 async def _generate_clause_embeddings(db, contract, contract_id: str):
-    import os
     from .models import ContractClause
     existing = contract.metadata_json or {}
     try:
@@ -478,17 +531,7 @@ async def _generate_clause_embeddings(db, contract, contract_id: str):
 
         clauses = db.query(ContractClause).filter(ContractClause.contract_id == contract_id).all()
         if clauses:
-            texts = [c.text_content for c in clauses]
-            import openai
-            client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            embeddings = []
-            for i in range(0, len(texts), 100):
-                chunk = texts[i:i+100]
-                res = await client.embeddings.create(
-                    model=_openai_embedding_model(), dimensions=_embedding_dimensions(),
-                    input=chunk
-                )
-                embeddings.extend([item.embedding for item in res.data])
+            embeddings = await _embed_texts([c.text_content for c in clauses])
 
             if len(embeddings) == len(clauses):
                 for clause, emb in zip(clauses, embeddings):
@@ -1383,6 +1426,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
 class ChatMessageIn(BaseModel):
     question: str
     history: list[dict] = []
+    session_id: str | None = None
 
 
 class ChatSourceOut(BaseModel):
@@ -1451,15 +1495,16 @@ async def chat_with_contract(
 
     from .chat_service import generate_chat_response
 
-    result = await generate_chat_response(
+    # Returns the CI-style chat contract:
+    # {answer, sources, actions, suggested_questions, route, query_scope,
+    #  conversation_mode, session_id}
+    return await generate_chat_response(
         contract=contract,
         question=question,
         history=payload.history,
         db=db,
+        session_id=payload.session_id,
     )
-
-    sources = [ChatSourceOut(**s) for s in result["sources"]]
-    return ChatResponseOut(answer=result["answer"], sources=sources)
 
 
 # ---------------------------------------------------------------------------
@@ -1729,6 +1774,7 @@ async def clause_repository_search(
 class AssistantChatIn(BaseModel):
     question: str
     history: list[dict] = []
+    session_id: str | None = None
 
 
 @app.post("/api/v1/assistant/chat")
@@ -1767,6 +1813,7 @@ async def assistant_chat(
         sources.append(
             {
                 "contract_id": str(contract.id),
+                "contract_name": contract.filename,
                 "contract_filename": contract.filename,
                 "clause_id": str(clause.id),
                 "clause_type": clause.clause_type,
@@ -1775,11 +1822,14 @@ async def assistant_chat(
             }
         )
 
+    from .chat_service import FOLLOWUP_INSTRUCTION, extract_followups, new_session_id, EMAIL_INTENT_RE
+
     system_prompt = (
-        "You are ContractsPulse Copilot for procurement managers. "
+        "You are Jaggaer Assist, the ContractsPulse copilot for procurement managers. "
         "You help answer questions and find relevant clause examples across the user's contracts. "
         "Use ONLY the provided clause excerpts. If you lack context, ask a follow-up question or say you can't confirm. "
         "When you cite a clause, mention the contract filename."
+        + FOLLOWUP_INSTRUCTION
     )
     history_messages = []
     for h in (payload.history or [])[-8:]:
@@ -1812,7 +1862,50 @@ async def assistant_chat(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Assistant chat failed: {str(e)}")
 
-    return {"answer": answer, "sources": sources}
+    answer, followups = extract_followups(answer)
+
+    # In-chat quick actions: open each cited contract, copy the first redline,
+    # jump to deviations where an analysis exists, draft an email on intent.
+    actions: list[dict] = []
+    seen_contracts: set[str] = set()
+    for clause, contract in matches:
+        cid = str(contract.id)
+        if cid in seen_contracts:
+            continue
+        seen_contracts.add(cid)
+        name = contract.filename or "contract"
+        short = name if len(name) <= 30 else name[:30] + "…"
+        actions.append({"type": "open_contract", "label": f"Open {short}", "contract_id": cid})
+        if (contract.metadata_json or {}).get("deviation_analysis"):
+            actions.append({"type": "view_deviations", "label": f"Deviations — {short}", "contract_id": cid})
+        if len(seen_contracts) >= 3:
+            break
+    redlined = next(((cl, co) for cl, co in matches if (cl.redline_suggestion or "").strip()), None)
+    if redlined:
+        actions.append({
+            "type": "copy_redline",
+            "label": f"Copy redline — {redlined[0].clause_type}",
+            "contract_id": str(redlined[1].id),
+            "clause_type": redlined[0].clause_type,
+            "text": redlined[0].redline_suggestion,
+        })
+    if EMAIL_INTENT_RE.search(question) and matches:
+        actions.append({
+            "type": "draft_email",
+            "label": "Draft vendor email",
+            "contract_id": str(matches[0][1].id),
+        })
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "actions": actions,
+        "suggested_questions": followups,
+        "route": "rag",
+        "query_scope": "portfolio",
+        "conversation_mode": "multi_turn" if (payload.history or []) else "single_turn",
+        "session_id": new_session_id(payload.session_id),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1830,12 +1923,20 @@ async def list_templates(
         .order_by(ContractTemplate.created_at.desc())
         .all()
     )
+    counts = dict(
+        db.query(TemplateClause.template_id, func.count(TemplateClause.id))
+        .filter(TemplateClause.template_id.in_([t.id for t in rows]))
+        .group_by(TemplateClause.template_id)
+        .all()
+    ) if rows else {}
     return {
         "templates": [
             {
                 "id": str(t.id),
                 "name": t.name,
                 "description": t.description,
+                "status": t.status or "PENDING",
+                "clause_count": int(counts.get(t.id, 0)),
                 "created_at": t.created_at.isoformat(),
             }
             for t in rows
@@ -1846,6 +1947,7 @@ async def list_templates(
 @app.post("/api/v1/templates")
 async def create_template(
     payload: TemplateCreateIn,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1861,23 +1963,186 @@ async def create_template(
         name=name,
         description=(payload.description or "").strip() or None,
         raw_text=raw_text,
+        status="PENDING",
     )
     db.add(t)
     db.commit()
     db.refresh(t)
-    return {"id": str(t.id)}
+    background_tasks.add_task(segment_and_embed_template, str(t.id))
+    return {"id": str(t.id), "status": "PENDING"}
 
 
-@app.post("/api/v1/contracts/{contract_id}/compare-template")
-async def compare_contract_to_template(
-    contract_id: str,
-    payload: TemplateCompareIn,
+@app.post("/api/v1/templates/upload")
+async def upload_template(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Upload a standard-template PDF ('our paper') and segment it in background."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        _, raw_text = await extract_text_from_pdf(file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {e}")
+    if not (raw_text or "").strip():
+        raise HTTPException(status_code=400, detail="No extractable text in the PDF")
+
+    name = (file.filename or "Template").rsplit(".", 1)[0].replace("_", " ").strip() or "Template"
+    t = ContractTemplate(
+        user_id=current_user.id,
+        name=name,
+        description="Uploaded template file",
+        raw_text=raw_text,
+        status="PENDING",
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    background_tasks.add_task(segment_and_embed_template, str(t.id))
+    return {"id": str(t.id), "name": t.name, "status": "PENDING"}
+
+
+@app.get("/api/v1/templates/{template_id}")
+async def get_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    t = (
+        db.query(ContractTemplate)
+        .filter(ContractTemplate.id == template_id, ContractTemplate.user_id == current_user.id)
+        .first()
+    )
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    clauses = (
+        db.query(TemplateClause)
+        .filter(TemplateClause.template_id == t.id)
+        .order_by(TemplateClause.position_index)
+        .all()
+    )
+    return {
+        "id": str(t.id),
+        "name": t.name,
+        "description": t.description,
+        "status": t.status or "PENDING",
+        "created_at": t.created_at.isoformat(),
+        "clauses": [
+            {
+                "id": str(c.id),
+                "clause_type": c.clause_type,
+                "text_content": c.text_content,
+                "position_index": c.position_index,
+                "has_embedding": c.embedding is not None,
+            }
+            for c in clauses
+        ],
+    }
+
+
+@app.delete("/api/v1/templates/{template_id}")
+async def delete_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    t = (
+        db.query(ContractTemplate)
+        .filter(ContractTemplate.id == template_id, ContractTemplate.user_id == current_user.id)
+        .first()
+    )
+    if not t:
+        raise HTTPException(status_code=404, detail="Template not found")
+    db.delete(t)
+    db.commit()
+    return {"message": "Template deleted"}
+
+
+async def segment_and_embed_template(template_id: str):
+    """Background pipeline: segment the template into typed clauses
+    (extractor agent with heuristic fallback) and embed them."""
+    import asyncio
+    from .database import SessionLocal
+    from .agents import extractor_agent, _heuristic_segment_clauses
+
+    db = SessionLocal()
+    try:
+        t = db.query(ContractTemplate).filter(ContractTemplate.id == template_id).first()
+        if not t:
+            return
+        t.status = "PROCESSING"
+        db.commit()
+
+        clauses = None
+        try:
+            timeout_s = float(os.getenv("CONTRACT_ANALYSIS_TIMEOUT_S", "60"))
+            run = await asyncio.wait_for(extractor_agent.run(t.raw_text), timeout=timeout_s)
+            clauses = run.output.clauses
+        except Exception as e:
+            print(f"Template extractor failed ({template_id}): {e}; using heuristic segmentation")
+            clauses = _heuristic_segment_clauses(t.raw_text)
+
+        db.query(TemplateClause).filter(TemplateClause.template_id == template_id).delete()
+        rows = []
+        for idx, c in enumerate(clauses):
+            row = TemplateClause(
+                template_id=template_id,
+                clause_type=c.clause_type,
+                text_content=c.text_content,
+                position_index=idx,
+            )
+            db.add(row)
+            rows.append(row)
+        db.commit()
+
+        try:
+            embeddings = await _embed_texts([(r.text_content or "")[:8000] for r in rows])
+            if len(embeddings) == len(rows):
+                for r, e in zip(rows, embeddings):
+                    r.embedding = e
+        except Exception as e:
+            print(f"Template embedding failed ({template_id}): {e}")
+
+        t.status = "READY"
+        db.commit()
+        print(f"Template {template_id} ready: {len(rows)} clauses segmented + embedded.")
+    except Exception as e:
+        print(f"Template pipeline failed ({template_id}): {e}")
+        try:
+            t = db.query(ContractTemplate).filter(ContractTemplate.id == template_id).first()
+            if t:
+                t.status = "FAILED"
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# First-party paper: deviation analysis vs a standard template
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/contracts/{contract_id}/analyze-deviations")
+async def analyze_contract_deviations(
+    contract_id: str,
+    payload: TemplateCompareIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Kick off deviation analysis of this contract against a standard template.
+
+    Runs in the background; poll GET /contracts/{id}/deviations for the result.
+    """
     contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
+    if contract.status != ContractStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="Contract analysis must be completed first.")
 
     template = (
         db.query(ContractTemplate)
@@ -1886,98 +2151,134 @@ async def compare_contract_to_template(
     )
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    embedded_count = (
+        db.query(TemplateClause)
+        .filter(TemplateClause.template_id == template.id, TemplateClause.embedding.isnot(None))
+        .count()
+    )
+    if (template.status or "") != "READY" or embedded_count == 0:
+        raise HTTPException(status_code=409, detail="Template is still processing — try again shortly.")
 
-    clauses = db.query(ContractClause).filter(ContractClause.contract_id == contract_id).all()
-    clauses_with_embeddings = [c for c in clauses if getattr(c, "embedding", None) is not None]
+    meta = dict(contract.metadata_json or {})
+    meta["deviation_status"] = "RUNNING"
+    meta["paper_mode"] = "FIRST_PARTY"
+    meta["paper_mode_source"] = "user"
+    meta["matched_template_id"] = str(template.id)
+    meta["processing_step"] = f"Aligning clauses against standard template '{template.name}'..."
+    contract.metadata_json = meta
+    log_contract_event(db, contract_id, "deviation", f"Deviation analysis started vs template '{template.name}'", {"template_id": str(template.id)})
+    db.commit()
 
-    # Chunk template into paragraphs for lightweight coverage check
-    paras = [p.strip() for p in re.split(r"\n{2,}", template.raw_text) if p.strip()]
-    paras = paras[:30]
+    background_tasks.add_task(run_deviation_analysis_background, contract_id, str(template.id))
+    return {"status": "RUNNING", "contract_id": contract_id, "template_id": str(template.id)}
 
-    import openai
-    import numpy as np
-    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    if not clauses_with_embeddings or not paras:
-        return {
-            "template_id": str(template.id),
-            "template_name": template.name,
-            "summary": "Insufficient embeddings or template text for semantic comparison.",
-            "missing_sections": [],
-            "nonstandard_sections": [],
-        }
-
-    # Embed template paragraphs
-    try:
-        emb = await client.embeddings.create(model=_openai_embedding_model(), dimensions=_embedding_dimensions(), input=paras)
-        para_embeddings = [d.embedding for d in emb.data]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
-
-    missing_sections = []
-
-    # Pre-calculate distances in memory to avoid N+1 DB queries
-    # We already have clauses_with_embeddings fetched earlier at the start of the endpoint.
-
-    # Pre-normalize clause embeddings outside the loop to optimize
-    clauses = []
-    ce_list = []
-    for clause in clauses_with_embeddings:
-        ce_np = np.array(clause.embedding)
-        norm = np.linalg.norm(ce_np)
-        if norm > 0:
-            ce_np = ce_np / norm
-        clauses.append(clause)
-        ce_list.append(ce_np)
-
-    ce_matrix = np.array(ce_list) if ce_list else np.empty((0, len(para_embeddings[0]) if para_embeddings else 0))
-
-    if clauses and para_embeddings:
-        pe_matrix = np.array(para_embeddings)
-        pe_norms = np.linalg.norm(pe_matrix, axis=1, keepdims=True)
-        pe_norms[pe_norms == 0] = 1.0
-        pe_matrix = pe_matrix / pe_norms
-
-        similarities = np.dot(pe_matrix, ce_matrix.T)
-        max_sim_indices = np.argmax(similarities, axis=1)
-    else:
-        max_sim_indices = []
-        similarities = []
-
-    for i, para in enumerate(paras):
-        nearest_clause = None
-
-        if clauses and para_embeddings:
-            nearest_clause_idx = max_sim_indices[i]
-            nearest_clause = clauses[nearest_clause_idx]
-            # dist = 1.0 - similarities[i, nearest_clause_idx]
-
-        if not nearest_clause:
-            missing_sections.append({"index": i, "template_excerpt": para[:260]})
-            continue
-
-        # Use a conservative heuristic:
-        # if clause type doesn't overlap with the para keywords, treat as potentially missing.
-        key = " ".join(re.findall(r"[A-Za-z]{5,}", para.lower())[:12])
-        if key and key not in ((nearest_clause.text_content or "").lower()):
-            missing_sections.append({"index": i, "template_excerpt": para[:260], "nearest_clause_type": nearest_clause.clause_type})
-
-    # Clause position sanity: compare ordering of top similar template paras vs clause index order
-    # (This is intentionally lightweight; UI can evolve later.)
-    nonstandard_sections = []
-    if len(paras) >= 6:
-        nonstandard_sections.append(
-            {
-                "note": "Position analysis is a v1 heuristic; focus on missing sections first.",
-            }
-        )
-
+@app.get("/api/v1/contracts/{contract_id}/deviations")
+async def get_contract_deviations(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    meta = contract.metadata_json or {}
     return {
-        "template_id": str(template.id),
-        "template_name": template.name,
-        "missing_sections": missing_sections[:12],
-        "nonstandard_sections": nonstandard_sections,
+        "status": meta.get("deviation_status"),
+        "paper_mode": meta.get("paper_mode"),
+        "matched_template_id": meta.get("matched_template_id"),
+        "deviation_analysis": meta.get("deviation_analysis"),
     }
+
+
+async def run_deviation_analysis_background(contract_id: str, template_id: str):
+    """Background stage: align → deviation agent → persist, mirroring the
+    redline-verification pipeline (status callbacks + heuristic fallback)."""
+    from .database import SessionLocal
+    from .deviation import align_clauses
+    from .agents import analyze_template_deviations
+
+    async def update_step(step_msg: str):
+        db_tmp = SessionLocal()
+        try:
+            c = db_tmp.query(Contract).filter(Contract.id == contract_id).first()
+            if c:
+                existing = dict(c.metadata_json or {})
+                existing["processing_step"] = step_msg
+                c.metadata_json = existing
+                log_contract_event(db_tmp, contract_id, "status", step_msg)
+                db_tmp.commit()
+        finally:
+            db_tmp.close()
+
+    db = SessionLocal()
+    try:
+        contract = db.query(Contract).filter(Contract.id == contract_id).first()
+        template = db.query(ContractTemplate).filter(ContractTemplate.id == template_id).first()
+        if not contract or not template:
+            return
+
+        template_clauses = (
+            db.query(TemplateClause)
+            .filter(TemplateClause.template_id == template_id)
+            .order_by(TemplateClause.position_index)
+            .all()
+        )
+        contract_clauses = db.query(ContractClause).filter(ContractClause.contract_id == contract_id).all()
+
+        await update_step("Aligning clauses against the standard template...")
+        alignment = align_clauses(template_clauses, contract_clauses)
+
+        try:
+            items = await analyze_template_deviations(alignment, use_llm=True, status_callback=update_step)
+            mode = "llm"
+        except Exception as e:
+            print(f"Deviation LLM pass failed, using heuristic: {e}")
+            items = await analyze_template_deviations(alignment, use_llm=False)
+            mode = "heuristic_fallback"
+
+        summary = alignment.summary()
+        summary["standard"] = sum(1 for i in items if i.get("playbook_verdict") == "STANDARD")
+        summary["off_playbook"] = sum(1 for i in items if i.get("playbook_verdict") == "OFF_PLAYBOOK")
+        summary["escalations"] = sum(1 for i in items if i.get("escalate"))
+
+        db2 = SessionLocal()
+        try:
+            c2 = db2.query(Contract).filter(Contract.id == contract_id).first()
+            meta = dict(c2.metadata_json or {})
+            meta["deviation_analysis"] = {
+                "template_id": template_id,
+                "template_name": template.name,
+                "paper_mode": "FIRST_PARTY",
+                "analysis_mode": mode,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+                "items": items,
+            }
+            meta["deviation_status"] = "COMPLETED"
+            meta["processing_step"] = "Deviation analysis complete."
+            c2.metadata_json = meta
+            log_contract_event(db2, contract_id, "deviation", "Deviation analysis completed", {"summary": summary, "mode": mode})
+            db2.commit()
+        finally:
+            db2.close()
+        print(f"Deviation analysis complete for {contract_id}: {summary}")
+    except Exception as e:
+        print(f"Deviation analysis failed for {contract_id}: {e}")
+        db3 = SessionLocal()
+        try:
+            c3 = db3.query(Contract).filter(Contract.id == contract_id).first()
+            if c3:
+                meta = dict(c3.metadata_json or {})
+                meta["deviation_status"] = "FAILED"
+                meta["processing_step"] = f"Deviation analysis failed: {type(e).__name__}"
+                c3.metadata_json = meta
+                log_contract_event(db3, contract_id, "error", "Deviation analysis failed", {"error": str(e) or type(e).__name__})
+                db3.commit()
+        finally:
+            db3.close()
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------

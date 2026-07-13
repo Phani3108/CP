@@ -1,4 +1,7 @@
 import os
+import re
+import json
+import uuid
 import openai
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -12,11 +15,51 @@ def _openai_chat_model() -> str:
     # Copied from main.py
     return (os.getenv("OPENAI_MODEL_CHAT") or "gpt-5.4").strip()
 
+
+# ---------------------------------------------------------------------------
+# CI-style chat contract helpers (shared by contract chat + global assistant)
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_INSTRUCTION = (
+    "\n\nFormatting: write the answer in clean Markdown — short paragraphs, bold for key terms, "
+    "GFM tables when comparing values, no top-level headers. "
+    'Then on the very LAST line output exactly: FOLLOWUPS: ["q1", "q2", "q3"] '
+    "— three short follow-up questions the user might naturally ask next, answerable from the "
+    "user's contracts. Output nothing after that line."
+)
+
+
+def extract_followups(answer: str) -> tuple[str, list[str]]:
+    """Split the model's trailing FOLLOWUPS: [...] line off the answer body."""
+    text = (answer or "").strip()
+    idx = text.rfind("FOLLOWUPS:")
+    if idx == -1:
+        return text, []
+    tail = text[idx + len("FOLLOWUPS:"):].strip()
+    body = text[:idx].rstrip()
+    followups: list[str] = []
+    m = re.search(r"\[.*?\]", tail, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            followups = [str(q).strip() for q in arr if str(q).strip()][:3]
+        except Exception:
+            followups = []
+    return (body or text), followups
+
+
+def new_session_id(existing: str | None = None) -> str:
+    return existing or str(uuid.uuid4())
+
+
+EMAIL_INTENT_RE = re.compile(r"\b(email|draft|negotiat|send to (the )?vendor|write to)\b", re.I)
+
 async def generate_chat_response(
     contract: Contract,
     question: str,
     history: list[dict],
     db: Session,
+    session_id: str | None = None,
 ):
     # Fetch all clauses for this contract
     clauses = db.query(ContractClause).filter(ContractClause.contract_id == contract.id).all()
@@ -97,12 +140,12 @@ async def generate_chat_response(
             history_messages.append({"role": role, "content": content})
 
     system_prompt = (
-        "You are a senior procurement legal assistant embedded in ContractsPulse. "
+        "You are Jaggaer Assist, a senior procurement legal assistant embedded in ContractsPulse. "
         "Answer questions about the contract based ONLY on the provided context. "
         "Be concise, precise, and procurement-focused. "
         "If the answer cannot be found in the provided context, say so clearly. "
-        "Do NOT make up contract terms. When quoting contract language, be exact. "
-        "Format responses clearly using short paragraphs. No markdown headers."
+        "Do NOT make up contract terms. When quoting contract language, be exact."
+        + FOLLOWUP_INSTRUCTION
     )
 
     raw_text_fallback = ""
@@ -144,12 +187,59 @@ async def generate_chat_response(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat AI failed: {str(e)}")
 
+    answer, followups = extract_followups(answer)
+
+    contract_name = contract.filename
     sources = []
     for c in top_clauses:
         sources.append({
+            "contract_id": str(contract.id),
+            "contract_name": contract_name,
+            "clause_id": str(c.id),
             "clause_type": c.clause_type,
             "risk_level": c.risk_level.value if c.risk_level else "LOW",
             "text_excerpt": (c.text_content or "")[:220],
         })
 
-    return {"answer": answer, "sources": sources}
+    # In-chat quick actions
+    actions: list[dict] = []
+    if top_clauses:
+        top = top_clauses[0]
+        actions.append({
+            "type": "view_clause",
+            "label": f"View {top.clause_type}",
+            "contract_id": str(contract.id),
+            "clause_type": top.clause_type,
+        })
+    redlined = next((c for c in top_clauses if (c.redline_suggestion or "").strip()), None)
+    if redlined:
+        actions.append({
+            "type": "copy_redline",
+            "label": f"Copy redline — {redlined.clause_type}",
+            "contract_id": str(contract.id),
+            "clause_type": redlined.clause_type,
+            "text": redlined.redline_suggestion,
+        })
+    if (contract.metadata_json or {}).get("deviation_analysis"):
+        actions.append({
+            "type": "view_deviations",
+            "label": "View template deviations",
+            "contract_id": str(contract.id),
+        })
+    if EMAIL_INTENT_RE.search(question):
+        actions.append({
+            "type": "draft_email",
+            "label": "Draft vendor email",
+            "contract_id": str(contract.id),
+        })
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "actions": actions,
+        "suggested_questions": followups,
+        "route": "rag" if has_embeddings else "keyword",
+        "query_scope": contract_name,
+        "conversation_mode": "multi_turn" if (history or []) else "single_turn",
+        "session_id": new_session_id(session_id),
+    }

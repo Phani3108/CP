@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Enum, Boolean
+from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Enum, Boolean, Integer
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
@@ -139,5 +139,23 @@ class ContractTemplate(Base):
     name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     raw_text = Column(Text, nullable=False)
+    # PENDING → PROCESSING → READY / FAILED (segmentation + embedding pipeline)
+    status = Column(String, default="PENDING")
 
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TemplateClause(Base):
+    """A segmented clause of a standard template ('our paper' baseline),
+    embedded for deviation alignment against incoming contract clauses."""
+    __tablename__ = "template_clauses"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    template_id = Column(UUID(as_uuid=True), ForeignKey("contract_templates.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    clause_type = Column(String, index=True)
+    text_content = Column(Text, nullable=False)
+    position_index = Column(Integer, default=0)
+
+    embedding = Column(Vector(1536), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

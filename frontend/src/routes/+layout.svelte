@@ -6,6 +6,8 @@
 	import { apiFetch, getApiBase } from '$lib/api';
 	import { onMount } from 'svelte';
 	import { navigating } from '$app/stores';
+	import { assist } from '$lib/assist.svelte';
+	import JaggaerAssist from '$lib/JaggaerAssist.svelte';
 
 	let { children } = $props();
 
@@ -15,50 +17,25 @@
 	let loginError = $state('');
 	let loading = $state(false);
 
-	let theme = $state<'light' | 'dark'>('light');
+	const NAV = [
+		{ href: '/', label: 'Dashboard', match: (p: string) => p === '/' },
+		{ href: '/contracts', label: 'Contracts', match: (p: string) => p.startsWith('/contracts') },
+		{ href: '/risk', label: 'Risk', match: (p: string) => p.startsWith('/risk') },
+		{ href: '/templates', label: 'Templates', match: (p: string) => p.startsWith('/templates') },
+		{ href: '/calendar', label: 'Calendar', match: (p: string) => p.startsWith('/calendar') },
+		{ href: '/vendors', label: 'Vendors', match: (p: string) => p.startsWith('/vendors') },
+		{ href: '/assist', label: 'Assist', match: (p: string) => p.startsWith('/assist') },
+		{ href: '/traces', label: 'Traces', match: (p: string) => p.startsWith('/traces') }
+	];
 
-	// Global assistant
-	type AssistantRole = 'user' | 'assistant';
-	type AssistantTurn = { role: AssistantRole; content: string; sources?: any[] };
-	let assistantOpen = $state(false);
-	let assistantMessages = $state<AssistantTurn[]>([]);
-	let assistantInput = $state('');
-	let assistantLoading = $state(false);
-
-	async function sendAssistant() {
-		const q = (assistantInput || '').trim();
-		if (!q || assistantLoading) return;
-		const history = assistantMessages.map((m) => ({ role: m.role, content: m.content }));
-		assistantMessages = [...assistantMessages, { role: 'user', content: q }];
-		assistantInput = '';
-		assistantLoading = true;
-		try {
-			const res = await apiFetch('/api/v1/assistant/chat', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ question: q, history })
-			});
-			const json = await res.json().catch(() => ({}));
-			if (!res.ok) throw new Error(json?.detail || 'Assistant failed');
-			assistantMessages = [...assistantMessages, { role: 'assistant', content: json.answer || '', sources: json.sources || [] }];
-		} catch (e: any) {
-			toast.error(e?.message || 'Assistant failed');
-		} finally {
-			assistantLoading = false;
-		}
-	}
-
-	function toggleTheme() {
-		theme = theme === 'light' ? 'dark' : 'light';
-		localStorage.setItem('cp_theme', theme);
-		document.documentElement.setAttribute('data-theme', theme);
-	}
+	const dockActive = $derived(
+		assist.open && assist.mode === 'docked' && !$page.url.pathname.startsWith('/assist')
+	);
 
 	onMount(async () => {
-		// Initialize theme preference (default to light)
-		theme = (localStorage.getItem('cp_theme') as 'light' | 'dark') || 'light';
-		document.documentElement.setAttribute('data-theme', theme);
-		// Fetch signup status first
+		// Light-only design language (CI). Keep the attribute so page-level
+		// [data-theme="light"] overrides continue to apply.
+		document.documentElement.setAttribute('data-theme', 'light');
 		try {
 			const statusRes = await apiFetch('/api/v1/auth/signup-status');
 			if (statusRes.ok) {
@@ -69,7 +46,6 @@
 			console.error('Failed to fetch signup status', e);
 		}
 
-		// Verify existing token if present
 		if (authState.token) {
 			try {
 				const meRes = await apiFetch('/api/v1/auth/me');
@@ -127,9 +103,9 @@
 	</div>
 {:else if !authState.isAuthenticated}
 	<div class="auth-container">
-		<div class="auth-card panel">
+		<div class="auth-card card animate-fadeIn">
 			<div class="auth-header">
-				<div class="workspace-avatar brand-mark brand-mark-lg" style="margin: 0 auto 16px;" aria-label="ContractsPulse logo">
+				<div class="brand-mark brand-mark-lg" style="margin: 0 auto 16px;" aria-label="ContractsPulse logo">
 					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 						<path d="M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z"/>
 						<path d="M14 3v4h4"/>
@@ -142,22 +118,22 @@
 
 			{#if !authState.signupDisabled}
 				<div class="auth-tabs" role="tablist" aria-label="Authentication Mode">
-					<button 
-						type="button" 
+					<button
+						type="button"
 						role="tab"
 						aria-selected={isLogin}
-						class="auth-tab" 
-						class:active={isLogin} 
+						class="auth-tab"
+						class:active={isLogin}
 						onclick={() => { isLogin = true; loginError = ''; }}
 					>
 						Log In
 					</button>
-					<button 
-						type="button" 
+					<button
+						type="button"
 						role="tab"
 						aria-selected={!isLogin}
-						class="auth-tab" 
-						class:active={!isLogin} 
+						class="auth-tab"
+						class:active={!isLogin}
 						onclick={() => { isLogin = false; loginError = ''; }}
 					>
 						Sign Up
@@ -171,35 +147,35 @@
 			<form onsubmit={handleSubmit} class="auth-form">
 				<div class="form-group">
 					<label for="email">Email</label>
-					<input 
-						type="email" 
-						id="email" 
-						bind:value={email} 
-						placeholder="you@domain.com" 
-						class="input-field" 
-						required 
+					<input
+						type="email"
+						id="email"
+						bind:value={email}
+						placeholder="you@domain.com"
+						class="input-field"
+						required
 					/>
 				</div>
 				<div class="form-group">
 					<label for="password">Password</label>
-					<input 
-						type="password" 
-						id="password" 
-						bind:value={password} 
-						placeholder="••••••••" 
-						class="input-field" 
-						required 
+					<input
+						type="password"
+						id="password"
+						bind:value={password}
+						placeholder="••••••••"
+						class="input-field"
+						required
 						minlength={isLogin ? undefined : 8}
 					/>
 				</div>
-				
+
 				{#if loginError}
 					<div class="error-msg">{loginError}</div>
 				{/if}
 
 				<button type="submit" class="btn btn-primary btn-block" style="margin-top: 8px;" disabled={loading}>
 					{#if loading}
-						<span class="spinner spinner-sm"></span>
+						<span class="spinner spinner-sm" style="border-top-color: #fff;"></span>
 					{:else}
 						Continue
 					{/if}
@@ -208,75 +184,39 @@
 		</div>
 	</div>
 {:else}
-	<div class="app-layout">
-		<aside class="sidebar">
-			<div class="workspace-switcher flex-row">
-				<div class="workspace-avatar brand-mark" aria-label="ContractsPulse logo">
+	<div class="app-shell" class:dock-active={dockActive}>
+		<header class="topbar">
+			<a href="/" class="brand">
+				<span class="brand-mark" aria-label="ContractsPulse logo">
 					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 						<path d="M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z"/>
 						<path d="M14 3v4h4"/>
 						<path d="M8 13h2l1.5-3 2 6 1.5-3H16"/>
 					</svg>
-				</div>
-				<div class="workspace-name">ContractsPulse</div>
-			</div>
+				</span>
+				<span class="brand-name">ContractsPulse</span>
+			</a>
 
-			<nav class="sidebar-nav">
-				<div class="nav-section">
-					<div class="nav-label">Workspace</div>
-					<a href="/" class="nav-item {$page.url.pathname === '/' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
-						Dashboard
+			<nav class="pill-nav" aria-label="Primary">
+				{#each NAV as item (item.href)}
+					<a href={item.href} class="pill-link" class:active={item.match($page.url.pathname)}>
+						{item.label}
 					</a>
-					<a href="/contracts" class="nav-item {$page.url.pathname === '/contracts' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-						Contract Repository
-					</a>
-					<a href="/risk" class="nav-item {$page.url.pathname === '/risk' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-						Risk Inbox
-					</a>
-					<a href="/calendar" class="nav-item {$page.url.pathname === '/calendar' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-						Calendar
-					</a>
-					<a href="/vendors" class="nav-item {$page.url.pathname === '/vendors' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 17l9 4 9-4"/><path d="M3 12l9 4 9-4"/></svg>
-						Vendors
-					</a>
-				</div>
-				
-				<div class="nav-section">
-					<div class="nav-label">System</div>
-					<a href="/traces" class="nav-item {$page.url.pathname === '/traces' ? 'active' : ''}">
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-						Agent Traces
-					</a>
-				</div>
+				{/each}
 			</nav>
-			
-			<div class="sidebar-footer">
+
+			<div class="topbar-right">
 				{#if authState.user}
-					<div class="user-info flex-row">
-						<div class="user-avatar">{authState.user.email[0].toUpperCase()}</div>
-						<div class="user-email" title={authState.user.email}>{authState.user.email}</div>
+					<div class="user-chip" title={authState.user.email}>
+						<span class="user-avatar">{authState.user.email[0].toUpperCase()}</span>
+						<span class="user-email">{authState.user.email}</span>
 					</div>
 				{/if}
-				<button type="button" class="nav-item nav-item-button" onclick={toggleTheme}>
-					{#if theme === 'light'}
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-						Dark Mode
-					{:else}
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-						Light Mode
-					{/if}
-				</button>
-				<button type="button" class="nav-item nav-item-button" onclick={() => authState.logout()}>
+				<button type="button" class="signout-btn" onclick={() => authState.logout()} title="Sign out" aria-label="Sign out">
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-					Sign Out
 				</button>
 			</div>
-		</aside>
+		</header>
 
 		<main class="main-content">
 			{@render children()}
@@ -287,70 +227,7 @@
 		<div class="nav-loading-bar"></div>
 	{/if}
 
-	<!-- Bottom-left assistant -->
-	<button class="assistant-fab" type="button" onclick={() => (assistantOpen = !assistantOpen)} aria-label="Open assistant">
-		<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H7l-4 4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
-	</button>
-
-	{#if assistantOpen}
-		<div class="assistant-panel panel">
-			<div class="assistant-head flex-between">
-				<div>
-					<div class="flex-row gap-8">
-						<div class="assistant-title">Sage</div>
-						<span class="ai-badge" title="Generated by AI. Verify against contract text.">
-							<svg class="ai-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l1.2 4.3L18 8l-4.8 1.7L12 14l-1.2-4.3L6 8l4.8-1.7L12 2z"/></svg>
-							AI
-						</span>
-					</div>
-					<div class="text-tertiary" style="font-size: 12px;">Search clauses + get answers</div>
-				</div>
-				<button class="btn btn-secondary btn-compact" type="button" onclick={() => (assistantOpen = false)}>Close</button>
-			</div>
-
-			<div class="assistant-body">
-				{#if assistantMessages.length === 0}
-					<div class="assistant-empty text-tertiary">
-						Try: “Find MFN clauses” or “What are our termination notice obligations across vendors?”
-					</div>
-				{:else}
-					{#each assistantMessages as m, idx (idx)}
-						<div class="assistant-msg {m.role}">
-							<div class="assistant-bubble">
-								<div class="assistant-role">{m.role === 'user' ? 'You' : 'Sage'}</div>
-								{#if m.role === 'assistant'}
-									<div class="ai-chip" style="margin-bottom: 8px;" title="This response was generated by AI.">
-										<svg class="ai-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l1.2 4.3L18 8l-4.8 1.7L12 14l-1.2-4.3L6 8l4.8-1.7L12 2z"/></svg>
-										AI answer
-									</div>
-								{/if}
-								<div class="assistant-content">{m.content}</div>
-							</div>
-						</div>
-					{/each}
-				{/if}
-			</div>
-
-			<div class="assistant-compose">
-				<textarea
-					class="assistant-textarea"
-					rows="1"
-					placeholder="Ask Sage…"
-					bind:value={assistantInput}
-					disabled={assistantLoading}
-					aria-label="Ask Sage assistant"
-					onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAssistant(); } }}
-				></textarea>
-				<button class="btn btn-primary assistant-send" type="button" onclick={sendAssistant} disabled={assistantLoading || !assistantInput.trim()} aria-label="Send">
-					{#if assistantLoading}
-						<span class="spinner spinner-sm"></span>
-					{:else}
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>
-					{/if}
-				</button>
-			</div>
-		</div>
-	{/if}
+	<JaggaerAssist />
 
 	<!-- Toast Container -->
 	<div class="toast-viewport">
@@ -374,7 +251,7 @@
 <style>
 	:global(.toast-viewport) {
 		position: fixed;
-		top: 24px;
+		top: 70px;
 		right: 24px;
 		display: flex;
 		flex-direction: column;
@@ -388,10 +265,10 @@
 		border: 1px solid var(--border-subtle);
 		color: var(--text-primary);
 		padding: 12px 16px;
-		border-radius: 8px;
+		border-radius: 12px;
 		font-size: 13px;
 		font-weight: 500;
-		box-shadow: var(--shadow-premium);
+		box-shadow: var(--shadow-lg);
 		pointer-events: auto;
 		animation: slideIn 220ms var(--ease-out) forwards;
 		transform-origin: top center;
@@ -400,13 +277,13 @@
 	:global(.toast-error) {
 		border-color: var(--glow-critical-border);
 		box-shadow: 0 8px 30px var(--glow-critical);
-		color: var(--color-critical);
+		color: var(--color-critical-text);
 	}
-	
+
 	:global(.toast-success) {
 		border-color: var(--glow-low-border);
 		box-shadow: 0 8px 30px var(--glow-low);
-		color: var(--color-low);
+		color: var(--color-low-text);
 	}
 
 	:global(.toast-content) {
@@ -420,301 +297,189 @@
 		to { opacity: 1; transform: translateY(0) scale(1); }
 	}
 
-	.app-layout {
+	/* ------------------------------------------------------------
+	   App shell — CI gradient topbar + content
+	   ------------------------------------------------------------- */
+	.app-shell {
 		display: flex;
+		flex-direction: column;
 		height: 100vh;
 		overflow: hidden;
+		transition: padding-right 260ms var(--ease-drawer);
+	}
+	.app-shell.dock-active {
+		padding-right: 400px;
+	}
+
+	.topbar {
+		position: sticky;
+		top: 0;
+		z-index: 100;
+		height: 56px;
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		gap: 18px;
+		padding: 0 18px;
+		background: var(--brand-gradient);
+		color: #fff;
+	}
+
+	.brand {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		text-decoration: none;
+		color: #fff;
+		flex-shrink: 0;
+	}
+	.brand-mark {
+		width: 28px;
+		height: 28px;
+		border-radius: 8px;
+		background: rgba(255, 255, 255, 0.18);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: #fff;
+	}
+	.brand-mark svg {
+		width: 16px;
+		height: 16px;
+	}
+	.brand-name {
+		font-size: 14.5px;
+		font-weight: 700;
+		letter-spacing: -0.01em;
+		white-space: nowrap;
+	}
+
+	.pill-nav {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex: 1;
+		justify-content: center;
+		overflow-x: auto;
+		scrollbar-width: none;
+	}
+	.pill-nav::-webkit-scrollbar {
+		display: none;
+	}
+	.pill-link {
+		padding: 6px 16px;
+		border-radius: var(--radius-pill);
+		color: rgba(255, 255, 255, 0.85);
+		text-decoration: none;
+		font-size: 13px;
+		font-weight: 500;
+		white-space: nowrap;
+		transition: background 150ms ease, color 150ms ease;
+	}
+	.pill-link:hover {
+		background: rgba(255, 255, 255, 0.12);
+		color: #fff;
+	}
+	.pill-link.active {
+		background: rgba(255, 255, 255, 0.2);
+		color: #fff;
+		font-weight: 600;
+	}
+
+	.topbar-right {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-shrink: 0;
+	}
+	.user-chip {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: rgba(255, 255, 255, 0.12);
+		border-radius: var(--radius-pill);
+		padding: 4px 12px 4px 4px;
+		max-width: 220px;
+	}
+	.user-avatar {
+		width: 24px;
+		height: 24px;
+		border-radius: 999px;
+		background: rgba(255, 255, 255, 0.25);
+		color: #fff;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 11px;
+		font-weight: 700;
+		flex-shrink: 0;
+	}
+	.user-email {
+		font-size: 12px;
+		color: rgba(255, 255, 255, 0.9);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.signout-btn {
+		width: 30px;
+		height: 30px;
+		border-radius: 999px;
+		border: none;
+		background: rgba(255, 255, 255, 0.12);
+		color: rgba(255, 255, 255, 0.9);
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		transition: background 150ms ease;
+	}
+	.signout-btn:hover {
+		background: rgba(255, 255, 255, 0.24);
+	}
+
+	.main-content {
+		flex: 1;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
 	}
 
 	.nav-loading-bar {
 		position: fixed;
-		left: 240px;
+		left: 0;
 		right: 0;
 		top: 0;
 		height: 2px;
-		background: linear-gradient(90deg, rgba(88,166,255,0.0), rgba(88,166,255,0.9), rgba(88,166,255,0.0));
+		background: linear-gradient(90deg, rgba(226, 43, 131, 0), rgba(226, 43, 131, 0.9), rgba(226, 43, 131, 0));
 		animation: shimmer 800ms linear infinite;
-		z-index: 120;
+		z-index: 220;
 	}
 	@keyframes shimmer {
 		0% { transform: translateX(-30%); }
 		100% { transform: translateX(30%); }
 	}
 
-	.assistant-fab {
-		position: fixed;
-		right: 16px;
-		bottom: 18px;
-		width: 44px;
-		height: 44px;
-		border-radius: 999px;
-		border: 1px solid var(--border-subtle);
-		background: var(--bg-panel);
-		color: var(--text-primary);
-		box-shadow: var(--shadow-premium);
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		cursor: pointer;
-		z-index: 150;
-	}
-	.assistant-fab:hover {
-		background: var(--bg-active);
-		border-color: var(--border-strong);
-	}
-	.assistant-panel {
-		position: fixed;
-		right: 16px;
-		bottom: 70px;
-		width: 380px;
-		max-width: calc(100vw - 32px);
-		height: 520px;
-		max-height: calc(100vh - 120px);
-		display: flex;
-		flex-direction: column;
-		padding: 0;
-		overflow: hidden;
-		z-index: 160;
-	}
-	.assistant-head {
-		padding: 12px 12px;
-		border-bottom: 1px solid var(--border-subtle);
-	}
-	.assistant-title {
-		font-weight: 700;
-	}
-	.assistant-body {
-		flex: 1;
-		overflow: auto;
-		padding: 12px;
-		background: var(--bg-app);
-	}
-	.assistant-empty {
-		padding: 18px 10px;
-		font-size: 12px;
-	}
-	.assistant-msg {
-		display: flex;
-		margin-bottom: 10px;
-	}
-	.assistant-msg.user {
-		justify-content: flex-end;
-	}
-	.assistant-bubble {
-		max-width: 92%;
-		padding: 10px 12px;
-		border: 1px solid var(--border-subtle);
-		border-radius: 12px;
-		background: var(--bg-panel);
-	}
-	.assistant-msg.user .assistant-bubble {
-		background: rgba(88, 166, 255, 0.06);
-		border-color: rgba(88, 166, 255, 0.22);
-	}
-	.assistant-role {
-		font-size: 11px;
-		color: var(--text-tertiary);
-		margin-bottom: 6px;
-	}
-	.assistant-content {
-		white-space: pre-wrap;
-		line-height: 1.35;
-	}
-	.assistant-compose {
-		display: grid;
-		grid-template-columns: 1fr auto;
-		gap: 10px;
-		padding: 10px 12px;
-		border-top: 1px solid var(--border-subtle);
-		background: var(--bg-panel);
-		align-items: end;
-	}
-	.assistant-textarea {
-		width: 100%;
-		resize: none;
-		min-height: 40px;
-		max-height: 140px;
-		padding: 10px 12px;
-		background: var(--bg-app);
-		border: 1px solid var(--border-subtle);
-		border-radius: 10px;
-		color: var(--text-primary);
-		font-size: 13px;
-		line-height: 1.35;
-		outline: none;
-	}
-	.assistant-textarea:focus {
-		border-color: var(--text-secondary);
-	}
-	.assistant-send {
-		height: 40px;
-		width: 42px;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		padding: 0;
-		border-radius: 10px;
+	@media (max-width: 900px) {
+		.brand-name { display: none; }
+		.user-chip { display: none; }
+		.app-shell.dock-active { padding-right: 0; }
 	}
 
-	.sidebar {
-		width: 240px;
-		background: var(--bg-sidebar);
-		border-right: 1px solid var(--border-subtle);
-		display: flex;
-		flex-direction: column;
-		flex-shrink: 0;
-	}
-
-	.workspace-switcher {
-		padding: 16px;
-		gap: 12px;
-		border-bottom: 1px solid var(--border-subtle);
-		cursor: pointer;
-		transition: background 100ms ease;
-	}
-
-	.workspace-switcher:hover {
-		background: var(--bg-hover);
-	}
-
-	.workspace-avatar {
-		width: 24px;
-		height: 24px;
-		background: var(--accent-primary);
-		color: var(--text-on-accent);
-		border-radius: 4px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-size: 12px;
-		font-weight: 600;
-	}
-
-	.brand-mark {
-		background: linear-gradient(135deg, #6e79e0 0%, #7c3aed 100%);
-		color: #fff;
-	}
-
-	.brand-mark svg {
-		width: 15px;
-		height: 15px;
-	}
-
-	.brand-mark-lg {
-		width: 48px;
-		height: 48px;
-		border-radius: 12px;
-		box-shadow: 0 6px 20px rgba(var(--ai-rgb), 0.28);
-	}
-
-	.brand-mark-lg svg {
-		width: 28px;
-		height: 28px;
-	}
-
-	.workspace-name {
-		font-size: 14px;
-		font-weight: 500;
-		color: var(--text-primary);
-	}
-
-	.sidebar-nav {
-		padding: 16px 8px;
-		flex: 1;
-	}
-
-	.nav-section {
-		margin-bottom: 24px;
-	}
-
-	.nav-label {
-		font-size: 11px;
-		font-weight: 600;
-		color: var(--text-secondary);
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
-		padding: 0 8px;
-		margin-bottom: 8px;
-	}
-
-	.nav-item {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		padding: 6px 8px;
-		color: var(--text-secondary);
-		text-decoration: none;
-		font-size: 13px;
-		font-weight: 500;
-		border-radius: 6px;
-		margin-bottom: 2px;
-		position: relative;
-		transition: background 160ms var(--ease-out), color 160ms var(--ease-out), transform 120ms var(--ease-out);
-	}
-
-	.nav-item:hover {
-		background: var(--bg-hover);
-		color: var(--text-primary);
-	}
-
-	.nav-item:active {
-		transform: scale(0.98);
-	}
-
-	.nav-item.active {
-		background: var(--bg-active);
-		color: var(--text-primary);
-	}
-
-	.nav-item.active::before {
-		content: '';
-		position: absolute;
-		left: 0;
-		top: 6px;
-		bottom: 6px;
-		width: 3px;
-		background-color: var(--accent-primary);
-		border-radius: 99px;
-	}
-
-	.main-content {
-		flex: 1;
-		background: var(--bg-app);
-		overflow-y: auto;
-		display: flex;
-		flex-direction: column;
-	}
-
-	.sidebar-footer {
-		padding: 16px 8px;
-		border-top: 1px solid var(--border-subtle);
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-	}
-
-	.nav-item-button {
-		width: 100%;
-		background: transparent;
-		border: none;
-		text-align: left;
-		cursor: pointer;
-		font: inherit;
-	}
-
-	/* Auth Screen Styles */
+	/* ------------------------------------------------------------
+	   Auth screen
+	   ------------------------------------------------------------- */
 	.auth-container {
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		height: 100vh;
-		background: var(--bg-app);
 	}
 
 	.auth-card {
 		width: 100%;
-		max-width: 360px;
-		padding: 32px;
+		max-width: 380px;
+		padding: 36px 32px;
 	}
 
 	.auth-header {
@@ -732,11 +497,28 @@
 		font-size: 13px;
 	}
 
+	:global(.brand-mark-lg) {
+		width: 52px;
+		height: 52px;
+		border-radius: 14px;
+		background: var(--brand-gradient) !important;
+		color: #fff;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		box-shadow: 0 8px 24px rgba(83, 0, 206, 0.3);
+	}
+
+	:global(.brand-mark-lg svg) {
+		width: 28px;
+		height: 28px;
+	}
+
 	.auth-tabs {
 		display: flex;
-		background: var(--bg-app);
+		background: var(--bg-hover);
 		border: 1px solid var(--border-subtle);
-		border-radius: 6px;
+		border-radius: var(--radius-pill);
 		padding: 3px;
 		margin-bottom: 24px;
 	}
@@ -748,8 +530,8 @@
 		color: var(--text-secondary);
 		font-size: 13px;
 		font-weight: 500;
-		padding: 6px 0;
-		border-radius: 4px;
+		padding: 7px 0;
+		border-radius: var(--radius-pill);
 		cursor: pointer;
 		transition: background 150ms var(--ease-out), color 150ms var(--ease-out), transform 100ms ease;
 		user-select: none;
@@ -760,7 +542,7 @@
 	}
 
 	.auth-tab.active {
-		background: var(--bg-hover);
+		background: #ffffff;
 		color: var(--text-primary);
 		box-shadow: var(--shadow-sm);
 	}
@@ -779,19 +561,20 @@
 
 	.input-field {
 		width: 100%;
-		padding: 8px 12px;
-		background: var(--bg-app);
-		border: 1px solid var(--border-subtle);
-		border-radius: 6px;
+		padding: 11px 14px;
+		background: var(--bg-hover);
+		border: 1.5px solid var(--border-subtle);
+		border-radius: var(--radius-md);
 		color: var(--text-primary);
 		font-size: 13px;
-		transition: border-color 150ms var(--ease-out);
+		transition: border-color 150ms var(--ease-out), background 150ms ease, box-shadow 150ms ease;
 		outline: none;
 	}
 
 	.input-field:focus {
 		border-color: var(--accent-primary);
-		box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.12);
+		background: #ffffff;
+		box-shadow: var(--ring);
 	}
 
 	.btn-block {
@@ -799,38 +582,9 @@
 	}
 
 	.error-msg {
-		color: var(--color-critical);
+		color: var(--color-critical-text);
 		font-size: 12px;
 		margin-top: 8px;
 		text-align: center;
-	}
-
-	/* User info in sidebar footer */
-	.user-info {
-		padding: 0 8px;
-		gap: 10px;
-	}
-
-	.user-avatar {
-		width: 22px;
-		height: 22px;
-		background: var(--bg-hover);
-		border: 1px solid var(--border-strong);
-		color: var(--text-primary);
-		border-radius: 50%;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-size: 11px;
-		font-weight: 600;
-	}
-
-	.user-email {
-		font-size: 12px;
-		font-weight: 500;
-		color: var(--text-secondary);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
 	}
 </style>
