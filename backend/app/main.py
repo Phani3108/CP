@@ -98,6 +98,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
+    # Single-origin mode: serve the SPA shell when a frontend build exists.
+    from pathlib import Path
+    index = Path(__file__).resolve().parent.parent.parent / "frontend" / "build" / "index.html"
+    if index.is_file():
+        from fastapi.responses import FileResponse
+        return FileResponse(index)
     return {"message": "ContractsPulse API is running"}
 
 @app.get("/health")
@@ -3912,3 +3918,30 @@ async def unlink_related_document(
     db.delete(rel)
     db.commit()
     return {"message": "Unlinked"}
+
+
+# ---------------------------------------------------------------------------
+# Single-origin launch: serve the built SPA (frontend/build) when present.
+# API routes are registered above and always win; unknown non-/api GET paths
+# fall back to the SPA shell so client-side routes deep-link correctly.
+# ---------------------------------------------------------------------------
+from pathlib import Path as _Path
+
+_SPA_DIR = _Path(__file__).resolve().parent.parent.parent / "frontend" / "build"
+if _SPA_DIR.is_dir():
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse, JSONResponse
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    app.mount("/", StaticFiles(directory=str(_SPA_DIR), html=True), name="spa")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _spa_fallback(request, exc):
+        if (exc.status_code == 404 and request.method == "GET"
+                and not request.url.path.startswith("/api")):
+            index = _SPA_DIR / "index.html"
+            if index.is_file():
+                return FileResponse(index)
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+    print(f"Serving SPA from {_SPA_DIR}")
