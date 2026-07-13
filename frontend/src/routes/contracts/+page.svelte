@@ -162,6 +162,38 @@
 		} catch { /* non-fatal */ }
 	}
 
+	// ---- Supplier snapshot (pre-intake check) ----
+	let supplierQuery = $state('');
+	let supplierSnapshot = $state<any>(null);
+	let supplierChecking = $state(false);
+
+	function ssRiskClass(risk: string | null | undefined): string {
+		const r = (risk || '').toUpperCase();
+		if (r === 'CRITICAL' || r === 'HIGH') return 'badge-danger';
+		if (r === 'MEDIUM') return 'badge-warning';
+		if (r === 'LOW') return 'badge-success';
+		return 'badge-secondary';
+	}
+
+	async function checkSupplier() {
+		const v = supplierQuery.trim();
+		if (!v || supplierChecking) return;
+		supplierChecking = true;
+		supplierSnapshot = null;
+		try {
+			const res = await apiFetch(`/api/v1/vendors/snapshot?name=${encodeURIComponent(v)}`);
+			if (!res.ok) {
+				const j = await res.json().catch(() => ({}));
+				throw new Error(j?.detail || 'Supplier check failed');
+			}
+			supplierSnapshot = await res.json();
+		} catch (e: any) {
+			toast.error(e?.message || 'Supplier check failed');
+		} finally {
+			supplierChecking = false;
+		}
+	}
+
 	function formatValue(v: number | null | undefined, cur: string | null | undefined): string {
 		if (v == null) return '—';
 		return `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 })} ${cur || ''}`.trim();
@@ -1017,7 +1049,7 @@
 					<svg class="dropzone-icon" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
 					<p class="dropzone-title">{isDragging ? 'Drop to upload' : 'Drag & drop PDF contracts here'}</p>
 					<p class="dropzone-sub text-tertiary">or <span class="dropzone-link">browse files</span> · PDF only · up to {formatBytes(MAX_UPLOAD_BYTES)} each</p>
-				</button>
+				</div>
 				{#if businessUnits.length > 0}
 					<div class="bu-select-row">
 						<label class="filter-group-label" for="bu-select-upload">Business unit:</label>
@@ -1029,8 +1061,60 @@
 						</select>
 					</div>
 				{/if}
-				<button type="button" class="hidden-marker" style="display:none">
+
+				<div class="ss-section">
+					<label class="filter-group-label" for="ss-supplier-input">Check supplier before intake</label>
+					<div class="ss-form">
+						<input
+							id="ss-supplier-input"
+							type="text"
+							class="ss-input"
+							placeholder="Supplier name — e.g. Replit"
+							bind:value={supplierQuery}
+							onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); checkSupplier(); } }}
+						/>
+						<button type="button" class="btn btn-secondary ss-check-btn" onclick={checkSupplier} disabled={supplierChecking || !supplierQuery.trim()}>
+							{#if supplierChecking}
+								<span class="spinner spinner-sm"></span>
+							{/if}
+							Check
+						</button>
+					</div>
+					{#if supplierSnapshot}
+						{#if supplierSnapshot.found}
+							<div class="ss-result">
+								<div class="ss-summary">
+									{supplierSnapshot.agreement_count} existing agreement{supplierSnapshot.agreement_count === 1 ? '' : 's'} across {(supplierSnapshot.business_units || []).map((b: any) => b.name).join(', ') || 'your organization'}
+								</div>
+								<div class="ss-facts">
+									{#if supplierSnapshot.total_committed_value != null}
+										<span class="ss-fact">Committed value: <strong>{Number(supplierSnapshot.total_committed_value).toLocaleString()}</strong></span>
+									{/if}
+									{#if supplierSnapshot.worst_risk}
+										<span class="badge badge-sm {ssRiskClass(supplierSnapshot.worst_risk)}">{supplierSnapshot.worst_risk} risk</span>
+									{/if}
+									{#if supplierSnapshot.off_playbook_deviations > 0}
+										<span class="badge badge-warning badge-sm">{supplierSnapshot.off_playbook_deviations} off-playbook deviation{supplierSnapshot.off_playbook_deviations === 1 ? '' : 's'}</span>
+									{/if}
+								</div>
+								{#if (supplierSnapshot.expiring_within_180d || []).length > 0}
+									<div class="ss-expiring">
+										<span class="ss-expiring-title">Expiring within 180 days</span>
+										{#each supplierSnapshot.expiring_within_180d as ex}
+											<div class="ss-expiring-row">
+												<span class="ss-exp-name" title={ex.filename}>{ex.filename}</span>
+												<span class="ss-exp-meta">{ex.business_unit ? `${ex.business_unit} · ` : ''}{ex.expiry_date}</span>
+											</div>
+										{/each}
+									</div>
+								{/if}
+							</div>
+						{:else}
+							<div class="ss-warning">No existing agreements found — new supplier. If there was no RFQ/sourcing event, this intake may be flagged as an RFQ bypass.</div>
+						{/if}
+					{/if}
 				</div>
+				<button type="button" class="hidden-marker" style="display:none"></button>
 
 				{#if uploadItems.length > 0}
 					<ul class="upload-list">
@@ -1844,6 +1928,110 @@
 		border-color: var(--accent-primary);
 		background: #fff;
 		box-shadow: var(--ring);
+	}
+
+	/* ---- Supplier snapshot (pre-intake check) ---- */
+	.ss-section {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		margin-top: 12px;
+		padding-top: 12px;
+		border-top: 1px solid var(--border-subtle);
+	}
+	.ss-form {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.ss-input {
+		flex: 1;
+		height: 34px;
+		padding: 0 12px;
+		border-radius: var(--radius-md);
+		border: 1.5px solid var(--border-subtle);
+		background: var(--bg-hover);
+		color: var(--text-primary);
+		font-size: 12.5px;
+		outline: none;
+	}
+	.ss-input:focus {
+		border-color: var(--accent-primary);
+		background: #fff;
+		box-shadow: var(--ring);
+	}
+	.ss-check-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		flex-shrink: 0;
+	}
+	.ss-check-btn:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.ss-result {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 12px 14px;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+		background: var(--bg-hover);
+	}
+	.ss-summary {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+	.ss-facts {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+	.ss-fact {
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+	.ss-expiring {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.ss-expiring-title {
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		color: var(--text-tertiary);
+	}
+	.ss-expiring-row {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 10px;
+		font-size: 12px;
+	}
+	.ss-exp-name {
+		color: var(--text-primary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+	}
+	.ss-exp-meta {
+		color: var(--text-tertiary);
+		white-space: nowrap;
+		flex-shrink: 0;
+	}
+	.ss-warning {
+		padding: 10px 14px;
+		font-size: 12.5px;
+		color: var(--color-medium-text);
+		background: rgba(var(--color-medium-rgb), 0.07);
+		border: 1px solid rgba(var(--color-medium-rgb), 0.25);
+		border-radius: var(--radius-md);
 	}
 
 </style>

@@ -878,19 +878,6 @@ CONTRACT_TYPES = ["MSA", "NDA", "SOW", "SLA", "DPA", "LICENSE", "SERVICES",
                   "PURCHASE", "EMPLOYMENT", "LEASE", "AMENDMENT", "OTHER"]
 
 
-class DynamicAttribute(BaseModel):
-    key: str = Field(description="Short human-readable label, e.g. 'Retainer fee', 'SLA uptime', 'Carve-out list'")
-    value: str = Field(description="The extracted value as concise text")
-    category: str = Field(default="general", description="One of: financial, dates, legal, operational, general")
-
-
-class DocumentReference(BaseModel):
-    title: str = Field(description="How the referenced document is named in the text, e.g. 'Replit Commercial Agreement'")
-    doc_type: str | None = Field(default=None, description=f"Best-guess type, one of: {', '.join(CONTRACT_TYPES)}")
-    relationship: str = Field(default="RELATED", description="One of: AMENDS, AMENDED_BY, ORDER_UNDER, MASTER_OF, RENEWS, INCORPORATES, RELATED")
-    date_mentioned: str | None = Field(default=None, description="ISO date if the reference cites one")
-
-
 class ContractMetadataResult(BaseModel):
     party_a: str | None = Field(default=None, description="First/issuing party legal name")
     party_b: str | None = Field(default=None, description="Counterparty legal name")
@@ -908,8 +895,10 @@ class ContractMetadataResult(BaseModel):
     governing_law: str | None = Field(default=None, description="e.g. 'New York' or 'Delaware'")
     business_unit_hint: str | None = Field(default=None, description="Business unit/division mentioned, if any")
     rfq_reference: str | None = Field(default=None, description="RFQ/RFP/PO/sourcing-event reference number if stated, else null")
-    dynamic_attributes: list[DynamicAttribute] = Field(default_factory=list, description="Up to 10 additional contract-specific facts worth surfacing that do not fit the fixed fields")
-    references_other_documents: list[DocumentReference] = Field(default_factory=list, description="Other agreements/documents this contract references (masters, amendments, order forms, exhibits incorporated by reference)")
+    # Flat string lists — nested object arrays are unreliable through the
+    # OpenAI-compat function-calling layer, so we parse these server-side.
+    dynamic_attributes: list[str] = Field(default_factory=list, description="Up to 10 additional contract-specific facts, EACH formatted exactly as 'Label :: value :: category' where category is one of financial, dates, legal, operational, general. Example: 'Retainer fee :: $59,000 in two installments :: financial'")
+    references_other_documents: list[str] = Field(default_factory=list, description="Other agreements this document explicitly references, EACH formatted exactly as 'RELATIONSHIP :: referenced document title :: TYPE' where RELATIONSHIP is one of AMENDS, ORDER_UNDER, MASTER_OF, RENEWS, INCORPORATES, RELATED and TYPE is the referenced document's contract type. Example: 'ORDER_UNDER :: Replit Commercial Agreement :: MSA'")
     confidence: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
@@ -917,6 +906,8 @@ metadata_agent = Agent(
     os.getenv("OPENAI_MODEL_METADATA", os.getenv("OPENAI_MODEL_RISK", "openai:gpt-4.1")),
     output_type=ContractMetadataResult,
     retries=3,
+    # long documents + thinking tokens starve the trailing list fields without this
+    model_settings={"max_tokens": 8192, "temperature": 0.1},
     system_prompt=(
         "You are a contract metadata extraction specialist for an enterprise contract repository. "
         "Extract ONLY facts stated in the text; use null when a field is absent — never guess. "
@@ -951,4 +942,34 @@ async def extract_contract_metadata_llm(raw_text: str) -> ContractMetadataResult
         mid = len(text) // 2
         snippet = text[:45000] + "\n...\n" + text[mid - 10000:mid + 10000] + "\n...\n" + text[-20000:]
     run = await metadata_agent.run(snippet)
+    return run.output
+
+
+class MetadataEnrichment(BaseModel):
+    dynamic_attributes: list[str] = Field(default_factory=list, description="Contract-specific facts, EACH as 'Label :: value :: category' (category: financial, dates, legal, operational, general)")
+    references_other_documents: list[str] = Field(default_factory=list, description="Referenced agreements, EACH as 'RELATIONSHIP :: document title :: TYPE' (RELATIONSHIP: AMENDS, ORDER_UNDER, MASTER_OF, RENEWS, INCORPORATES, RELATED)")
+
+
+enrichment_agent = Agent(
+    os.getenv("OPENAI_MODEL_EXTRACTOR", "openai:gpt-4.1-mini"),
+    output_type=MetadataEnrichment,
+    retries=2,
+    model_settings={"max_tokens": 4096, "temperature": 0.1},
+    system_prompt=(
+        "You mine contracts for two things ONLY. "
+        "1) dynamic_attributes: 5-10 contract-specific facts a procurement reviewer wants at a glance "
+        "(fees, caps, SLAs, carve-outs, deadlines, named personnel, special rights) — each formatted "
+        "'Label :: concise value :: category'. "
+        "2) references_other_documents: every OTHER agreement this document explicitly references "
+        "(the master it operates under, documents it amends/renews, incorporated terms) — each formatted "
+        "'RELATIONSHIP :: referenced document title :: TYPE'. "
+        "Both lists MUST be populated when the text supports it."
+    )
+)
+
+
+async def extract_metadata_enrichment(raw_text: str) -> MetadataEnrichment:
+    text = raw_text or ""
+    snippet = text[:20000]
+    run = await enrichment_agent.run(snippet)
     return run.output

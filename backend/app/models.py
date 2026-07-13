@@ -232,3 +232,15 @@ class SavedSearch(Base):
     question = Column(Text, nullable=True)      # original NL question, if any
     filters_json = Column(JSONB, default={})    # validated filter set to re-execute
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ContractRelationship(Base):
+    """Typed link between related documents (amendment, order form, master...)."""
+    __tablename__ = "contract_relationships"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    related_contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    relationship_type = Column(String, nullable=False, default="RELATED")  # AMENDS|ORDER_UNDER|MASTER_OF|RENEWS|INCORPORATES|RELATED
+    source = Column(String, nullable=False, default="user")  # user | auto
+    created_at = Column(DateTime, default=datetime.utcnow)

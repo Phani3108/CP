@@ -786,6 +786,85 @@
 		if (activeTab === 'deviation') loadTemplatesList();
 	});
 
+	// --- Portfolio intelligence (overview tab) ---
+	let insightsData = $state<any>(null);
+	let relatedData = $state<any>(null);
+	let insightsLoading = $state(false);
+	let showPrecedents = $state(false);
+
+	async function loadIntelligence() {
+		if (insightsLoading) return;
+		insightsLoading = true;
+		try {
+			const [insRes, relRes] = await Promise.all([
+				apiFetch(`/api/v1/contracts/${contractId}/insights`),
+				apiFetch(`/api/v1/contracts/${contractId}/related`)
+			]);
+			insightsData = insRes.ok ? await insRes.json() : {};
+			relatedData = relRes.ok ? await relRes.json() : {};
+		} catch {
+			insightsData = insightsData || {};
+			relatedData = relatedData || {};
+		} finally {
+			insightsLoading = false;
+		}
+	}
+
+	function copyIntelText(text: string) {
+		navigator.clipboard.writeText(text || '');
+		toast.success('Copied to clipboard');
+	}
+
+	async function linkSuggestion(s: any) {
+		try {
+			const res = await apiFetch(`/api/v1/contracts/${contractId}/related`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					related_contract_id: s.contract.id,
+					relationship_type: s.relationship_type
+				})
+			});
+			if (!res.ok) {
+				const j = await res.json().catch(() => ({}));
+				throw new Error(j?.detail || 'Failed to link document');
+			}
+			toast.success('Documents linked');
+			insightsData = null;
+			relatedData = null;
+			await loadIntelligence();
+		} catch (e: any) {
+			toast.error(e?.message || 'Failed to link document');
+		}
+	}
+
+	const intelGaps = $derived((insightsData?.coverage_gaps || []) as any[]);
+	const intelPrecedents = $derived((insightsData?.precedents || []) as any[]);
+	const intelAmbiguities = $derived((insightsData?.ambiguities || []) as any[]);
+	const intelLinks = $derived((relatedData?.links || []) as any[]);
+	const intelSuggestions = $derived((relatedData?.suggestions || []) as any[]);
+	const intelAttributes = $derived((contract?.metadata_json?.dynamic_attributes || []) as any[]);
+	const intelHasContent = $derived(
+		intelGaps.length > 0 ||
+			intelPrecedents.length > 0 ||
+			intelAmbiguities.length > 0 ||
+			intelLinks.length > 0 ||
+			intelSuggestions.length > 0 ||
+			intelAttributes.length > 0
+	);
+
+	// Reset intelligence when navigating to a different contract
+	$effect(() => {
+		contractId;
+		insightsData = null;
+		relatedData = null;
+		showPrecedents = false;
+	});
+
+	$effect(() => {
+		if (activeTab === 'overview' && contract?.status === 'COMPLETED' && !insightsData && !insightsLoading) loadIntelligence();
+	});
+
 	// Jaggaer Assist page context: contract-scoped answers while viewing this contract.
 	$effect(() => {
 		assist.setPageContext(
@@ -1140,6 +1219,123 @@
 										</div>
 									{/each}
 								</div>
+							</div>
+						{/if}
+						{#if contract.status === 'COMPLETED' && (insightsLoading || intelHasContent)}
+							<div class="overview-section">
+								<div class="flex-row gap-8" style="margin-bottom: 8px;">
+									<h3 class="subsection-title" style="margin: 0;">Portfolio Intelligence</h3>
+									<span class="ai-badge" title="Insights derived from your portfolio, templates and linked documents. Verify against contract text.">
+										<svg class="ai-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l1.2 4.3L18 8l-4.8 1.7L12 14l-1.2-4.3L6 8l4.8-1.7L12 2z"/></svg>
+										AI
+									</span>
+								</div>
+								{#if insightsLoading}
+									<div class="clauses-loading">
+										<span class="spinner spinner-md"></span>
+										<p>Loading portfolio intelligence...</p>
+									</div>
+								{:else}
+									<div class="intel-card bg-panel-glow">
+										{#if intelGaps.length > 0}
+											<div class="intel-subsection">
+												<h4 class="intel-heading">Missing Clauses</h4>
+												{#each intelGaps as gap}
+													<div class="intel-row">
+														<span class="badge badge-danger badge-sm">MISSING</span>
+														<div class="intel-row-main">
+															<span class="intel-row-title">{gap.clause_type}</span>
+															<span class="intel-caption">{gap.source === 'template' ? 'Deleted vs standard template' : `Present in ${gap.presence_pct}% of similar agreements`}</span>
+														</div>
+														{#if gap.suggested_text}
+															<button class="btn btn-secondary intel-btn" onclick={() => copyIntelText(gap.suggested_text)}>Copy standard language</button>
+														{/if}
+													</div>
+												{/each}
+											</div>
+										{/if}
+
+										{#if intelPrecedents.length > 0}
+											<div class="intel-subsection">
+												<div class="intel-heading-row">
+													<h4 class="intel-heading">Approved Precedents</h4>
+													<button class="intel-toggle" onclick={() => (showPrecedents = !showPrecedents)}>
+														{showPrecedents ? 'Hide' : `Show ${intelPrecedents.length}`}
+													</button>
+												</div>
+												{#if showPrecedents}
+													{#each intelPrecedents as p}
+														<div class="intel-row">
+															<span class="badge badge-success badge-sm">{p.approved_via === 'feedback' ? 'User approved' : 'Low risk'}</span>
+															<div class="intel-row-main">
+																<span class="intel-row-title">{p.clause_type}</span>
+																<span class="intel-caption">{p.contract_filename}</span>
+																{#if p.text_excerpt}
+																	<pre class="intel-excerpt">{p.text_excerpt}</pre>
+																{/if}
+															</div>
+															<button class="btn btn-secondary intel-btn" onclick={() => copyIntelText(p.text_excerpt)}>Copy</button>
+														</div>
+													{/each}
+												{/if}
+											</div>
+										{/if}
+
+										{#if intelAmbiguities.length > 0}
+											<div class="intel-subsection">
+												<h4 class="intel-heading">Ambiguities</h4>
+												{#each intelAmbiguities as amb}
+													<div class="intel-row">
+														<span class="badge badge-warning badge-sm">{amb.risk_level || 'AMBIGUOUS'}</span>
+														<div class="intel-row-main">
+															<span class="intel-row-title">{amb.clause_type}</span>
+															<span class="intel-caption">{amb.reason}</span>
+														</div>
+													</div>
+												{/each}
+											</div>
+										{/if}
+
+										{#if intelLinks.length > 0 || intelSuggestions.length > 0}
+											<div class="intel-subsection">
+												<h4 class="intel-heading">Related Documents</h4>
+												{#each intelLinks as l (l.relationship_id)}
+													<button class="intel-row intel-row-link" onclick={() => goto(`/contracts/${l.contract.id}`)}>
+														<span class="badge badge-blue badge-sm">{l.relationship_type}</span>
+														<div class="intel-row-main">
+															<span class="intel-row-title">{l.contract.filename}</span>
+															<span class="intel-caption">{l.contract.contract_type || 'Document'}{l.contract.business_unit ? ` · ${l.contract.business_unit}` : ''}</span>
+														</div>
+													</button>
+												{/each}
+												{#each intelSuggestions as s}
+													<div class="intel-row">
+														<span class="badge badge-secondary badge-sm">{s.relationship_type}</span>
+														<div class="intel-row-main">
+															<span class="intel-row-title">{s.contract.filename}</span>
+															<span class="intel-caption">Suggested: {s.reference_title}</span>
+														</div>
+														<button class="btn btn-secondary intel-btn" onclick={() => linkSuggestion(s)}>Link</button>
+													</div>
+												{/each}
+											</div>
+										{/if}
+
+										{#if intelAttributes.length > 0}
+											<div class="intel-subsection">
+												<h4 class="intel-heading">Extracted Attributes</h4>
+												<div class="intel-attr-grid">
+													{#each intelAttributes as attr}
+														<div class="intel-attr">
+															<span class="intel-attr-key">{attr.key}</span>
+															<span class="intel-attr-value">{attr.value}</span>
+														</div>
+													{/each}
+												</div>
+											</div>
+										{/if}
+									</div>
+								{/if}
 							</div>
 						{/if}
 					</div>
@@ -3912,5 +4108,133 @@
 		gap: 10px;
 		align-items: center;
 		padding-top: 4px;
+	}
+
+	/* Portfolio intelligence (overview tab) */
+	.intel-card {
+		display: flex;
+		flex-direction: column;
+		gap: 18px;
+		padding: 16px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 12px;
+	}
+	.intel-subsection {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.intel-heading {
+		margin: 0;
+		font-size: 11px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.6px;
+		color: var(--text-tertiary);
+	}
+	.intel-heading-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+	}
+	.intel-toggle {
+		background: none;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-pill);
+		padding: 2px 10px;
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--accent-primary);
+		cursor: pointer;
+	}
+	.intel-toggle:hover {
+		background: var(--bg-hover);
+	}
+	.intel-row {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 9px 12px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 10px;
+		background: var(--bg-panel);
+	}
+	.intel-row .badge {
+		flex-shrink: 0;
+		margin-top: 1px;
+	}
+	.intel-row-link {
+		width: 100%;
+		text-align: left;
+		font: inherit;
+		cursor: pointer;
+		transition: background 0.15s var(--ease-out);
+	}
+	.intel-row-link:hover {
+		background: var(--bg-hover);
+	}
+	.intel-row-main {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+		flex: 1;
+	}
+	.intel-row-title {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+		overflow-wrap: anywhere;
+	}
+	.intel-caption {
+		font-size: 12px;
+		color: var(--text-tertiary);
+	}
+	.intel-excerpt {
+		margin: 4px 0 0;
+		padding: 8px 10px;
+		font-family: 'SF Mono', ui-monospace, monospace;
+		font-size: 11.5px;
+		line-height: 1.5;
+		color: var(--text-secondary);
+		background: var(--bg-hover);
+		border-radius: 8px;
+		white-space: pre-wrap;
+		overflow: hidden;
+		display: -webkit-box;
+		-webkit-line-clamp: 3;
+		-webkit-box-orient: vertical;
+	}
+	.intel-btn {
+		flex-shrink: 0;
+		padding: 4px 12px;
+		font-size: 12px;
+	}
+	.intel-attr-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 8px;
+	}
+	.intel-attr {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		padding: 8px 12px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 10px;
+		background: var(--bg-panel);
+	}
+	.intel-attr-key {
+		font-size: 11px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.4px;
+		color: var(--text-tertiary);
+	}
+	.intel-attr-value {
+		font-size: 13px;
+		color: var(--text-primary);
+		overflow-wrap: anywhere;
 	}
 </style>

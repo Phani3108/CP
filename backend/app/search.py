@@ -11,7 +11,7 @@ import re
 from datetime import date, datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, text as sqltext
 
 from .models import Contract, ContractStatus
 
@@ -199,6 +199,12 @@ def build_query(base_query, f: SearchFilters):
                          Contract.company.ilike(term),
                          Contract.counterparty.ilike(term),
                          Contract.contract_type.ilike(term)))
+    if f.content_terms:
+        # Postgres FTS over the stored contract body (expression GIN index)
+        q = q.filter(sqltext(
+            "to_tsvector('english', coalesce(left(contracts.metadata_json->>'raw_text', 400000), '')) "
+            "@@ websearch_to_tsquery('english', :content_terms)"
+        ).bindparams(content_terms=f.content_terms.replace("-", " ")))
 
     sort_col = {
         "expiry_date": Contract.expiry_date,

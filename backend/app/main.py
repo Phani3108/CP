@@ -478,6 +478,17 @@ async def startup_event():
             "WHERE renewal_notice_days IS NULL AND metadata_json->>'renewal_notice_days' ~ '^\\d+$';"
         ))
 
+    # Full-text search over contract bodies + clause text (expression GIN indexes)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_contracts_rawtext_fts ON contracts "
+            "USING GIN (to_tsvector('english', coalesce(left(metadata_json->>'raw_text', 400000), '')));"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_clauses_fts ON contract_clauses "
+            "USING GIN (to_tsvector('english', text_content));"
+        ))
+
     # Seed default user if not exists
     from sqlalchemy.orm import sessionmaker
     SessionLocal = sessionmaker(bind=engine)
@@ -849,7 +860,9 @@ async def _extract_and_save_metadata(contract, raw_text: str):
 
     Mirrors _extract_and_save_obligations: non-fatal on any failure.
     """
-    existing = contract.metadata_json or {}
+    # COPY the loaded JSONB — mutating it in place also mutates SQLAlchemy's
+    # committed-state snapshot, and the flush diff then sees "no change".
+    existing = dict(contract.metadata_json or {})
     try:
         from .agents import extract_contract_metadata_llm, CONTRACT_TYPES
         m = await extract_contract_metadata_llm(raw_text)
@@ -895,17 +908,72 @@ async def _extract_and_save_metadata(contract, raw_text: str):
             "completeness_score": contract.completeness_score,
         }
         existing.update({k: v for k, v in updates.items() if v is not None})
-        if m.dynamic_attributes:
-            existing["dynamic_attributes"] = [
-                {"key": a.key, "value": a.value, "category": a.category}
-                for a in m.dynamic_attributes[:10]
-            ]
-        if m.references_other_documents:
-            existing["document_references"] = [
-                {"title": r.title, "doc_type": r.doc_type, "relationship": r.relationship,
-                 "date_mentioned": r.date_mentioned}
-                for r in m.references_other_documents[:8]
-            ]
+        def _split3(entry: str) -> tuple[str, str, str]:
+            parts = [p.strip() for p in str(entry).split("::")]
+            a = parts[0] if len(parts) > 0 else ""
+            b = parts[1] if len(parts) > 1 else ""
+            c = parts[2] if len(parts) > 2 else ""
+            return a, b, c
+
+        def _parse_attrs(entries):
+            out = []
+            for entry in (entries or [])[:10]:
+                key, value, category = _split3(entry)
+                if key and value:
+                    out.append({"key": key, "value": value,
+                                "category": (category or "general").lower()})
+            return out
+
+        VALID_REL = {"AMENDS", "AMENDED_BY", "ORDER_UNDER", "MASTER_OF", "RENEWS", "INCORPORATES", "RELATED"}
+
+        def _parse_refs(entries):
+            out = []
+            for entry in (entries or [])[:8]:
+                rel, title, doc_type = _split3(entry)
+                rel = rel.upper().replace(" ", "_")
+                if title:
+                    out.append({"title": title,
+                                "relationship": rel if rel in VALID_REL else "RELATED",
+                                "doc_type": doc_type or None,
+                                "date_mentioned": None})
+            return out
+
+        attrs = _parse_attrs(m.dynamic_attributes)
+        refs = _parse_refs(m.references_other_documents)
+
+        # Focused second pass — the wide scalar extraction reliably starves or
+        # mangles these two lists; a dedicated small agent fills them in.
+        if not attrs and not refs:
+            try:
+                from .agents import extract_metadata_enrichment
+                enrich = await extract_metadata_enrichment(raw_text)
+                attrs = attrs or _parse_attrs(enrich.dynamic_attributes)
+                refs = refs or _parse_refs(enrich.references_other_documents)
+            except Exception as ee:
+                print(f"Metadata enrichment pass failed (non-fatal): {ee}")
+
+        if attrs:
+            existing["dynamic_attributes"] = attrs
+        if refs:
+            existing["document_references"] = refs
+        # RFQ-bypass heuristic: new vendor to the org AND no sourcing reference.
+        try:
+            from sqlalchemy.orm import object_session
+            dbs = object_session(contract)
+            vendor = (contract.counterparty or "").strip()
+            if dbs is not None and vendor and not (m.rfq_reference or "").strip():
+                prior = (
+                    dbs.query(Contract)
+                    .filter(Contract.id != contract.id,
+                            Contract.counterparty.ilike(f"%{vendor.split(',')[0][:40]}%"))
+                    .first()
+                )
+                existing["rfq_bypass_suspect"] = prior is None
+            elif (m.rfq_reference or "").strip():
+                existing["rfq_bypass_suspect"] = False
+        except Exception:
+            pass
+
         contract.metadata_json = dict(existing)
     except Exception as me:
         print(f"Metadata extraction failed (non-fatal): {me}")
@@ -3533,3 +3601,310 @@ async def admin_get_conversation(
             for m in messages
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Clause intelligence: coverage gaps, approved precedents, ambiguity flags
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/contracts/{contract_id}/insights")
+async def contract_insights(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .insights import compute_insights
+    contract = get_accessible_contract(db, contract_id, current_user)
+    return compute_insights(db, contract, current_user)
+
+
+# ---------------------------------------------------------------------------
+# Supplier snapshot — performance visibility during intake
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/vendors/snapshot")
+async def vendor_snapshot(
+    name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-BU supplier history for intake decisions: agreements by unit,
+    committed value, risk profile, deviation posture, expiring paper."""
+    from .models import BusinessUnit
+    term = f"%{(name or '').strip()}%"
+    if not term.strip('%'):
+        raise HTTPException(status_code=400, detail="name is required")
+
+    q = db.query(Contract).filter(or_(Contract.counterparty.ilike(term),
+                                      Contract.company.ilike(term),
+                                      Contract.filename.ilike(term)))
+    if current_user.org_id:
+        q = (q.join(BusinessUnit, Contract.business_unit_id == BusinessUnit.id)
+             .filter(BusinessUnit.org_id == current_user.org_id))
+    else:
+        q = q.filter(Contract.user_id == current_user.id)
+    rows = q.all()
+    if not rows:
+        return {"vendor": name, "found": False}
+
+    from datetime import date, timedelta
+    sev = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    total_value = 0.0
+    worst = "LOW"
+    off_playbook = 0
+    deviation_runs = 0
+    by_bu: dict = {}
+    expiring = []
+    for c in rows:
+        if c.total_value is not None:
+            total_value += float(c.total_value)
+        counts = (c.metadata_json or {}).get("risk_counts") or {}
+        for lvl in ("CRITICAL", "HIGH", "MEDIUM"):
+            if counts.get(lvl):
+                if sev[lvl] > sev[worst]:
+                    worst = lvl
+                break
+        dev = (c.metadata_json or {}).get("deviation_analysis") or {}
+        if dev:
+            deviation_runs += 1
+            off_playbook += int((dev.get("summary") or {}).get("off_playbook") or 0)
+        bu = c.business_unit or "Unassigned"
+        by_bu[bu] = by_bu.get(bu, 0) + 1
+        if c.expiry_date and c.expiry_date <= date.today() + timedelta(days=180):
+            expiring.append({"id": str(c.id), "filename": c.filename,
+                             "expiry_date": c.expiry_date.isoformat(),
+                             "business_unit": bu})
+
+    return {
+        "vendor": name,
+        "found": True,
+        "agreement_count": len(rows),
+        "business_units": [{"name": k, "count": v} for k, v in sorted(by_bu.items())],
+        "total_committed_value": round(total_value, 2) or None,
+        "worst_risk": worst,
+        "deviation_runs": deviation_runs,
+        "off_playbook_deviations": off_playbook,
+        "expiring_within_180d": expiring[:5],
+    }
+
+
+# ---------------------------------------------------------------------------
+# AI Portfolio Review — replaces the manual periodic review
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/portfolio/review")
+async def generate_portfolio_review(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Gather deterministic portfolio facts, have Gemini write the executive
+    review with a prioritized action list."""
+    from datetime import date, timedelta
+    contracts = (db.query(Contract)
+                 .filter(bu_scope_criterion(current_user))
+                 .order_by(Contract.created_at.desc())
+                 .limit(200).all())
+
+    today = date.today()
+    facts = {
+        "total_contracts": len(contracts),
+        "expiring_90d": [],
+        "auto_renew_notice": [],
+        "off_playbook": [],
+        "incomplete_metadata": [],
+        "critical_risk": [],
+        "rfq_bypass": [],
+    }
+    for c in contracts:
+        meta = c.metadata_json or {}
+        if c.expiry_date and today <= c.expiry_date <= today + timedelta(days=90):
+            facts["expiring_90d"].append(f"{c.filename} expires {c.expiry_date.isoformat()}")
+        if c.auto_renewal and c.expiry_date:
+            notice_days = c.renewal_notice_days or 30
+            deadline = c.expiry_date - timedelta(days=notice_days)
+            if today <= deadline <= today + timedelta(days=120):
+                facts["auto_renew_notice"].append(
+                    f"{c.filename}: non-renewal notice due {deadline.isoformat()} ({notice_days}d before {c.expiry_date.isoformat()})")
+        dev = (meta.get("deviation_analysis") or {}).get("summary") or {}
+        if dev.get("off_playbook"):
+            facts["off_playbook"].append(f"{c.filename}: {dev['off_playbook']} off-standard clauses ({dev.get('escalations', 0)} escalations)")
+        if c.completeness_score is not None and c.completeness_score < 0.5:
+            facts["incomplete_metadata"].append(f"{c.filename} ({int(c.completeness_score * 100)}% complete)")
+        counts = meta.get("risk_counts") or {}
+        if counts.get("CRITICAL"):
+            facts["critical_risk"].append(f"{c.filename}: {counts['CRITICAL']} critical clauses")
+        if meta.get("rfq_bypass_suspect"):
+            facts["rfq_bypass"].append(c.filename)
+
+    fact_lines = []
+    for k, v in facts.items():
+        if isinstance(v, list) and v:
+            fact_lines.append(f"{k}: " + "; ".join(v[:8]))
+    facts_text = "\n".join(fact_lines) or "(no findings)"
+
+    import openai
+    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    try:
+        resp = await client.chat.completions.create(
+            model=_openai_chat_model(),
+            messages=[
+                {"role": "system", "content": (
+                    "You are a contract portfolio reviewer for a procurement organization. "
+                    "Write a crisp executive review in Markdown from ONLY the facts provided: "
+                    "a 2-3 sentence health summary, then '### Priority actions' as a numbered "
+                    "list (most urgent first, each citing the specific contract and date), then "
+                    "'### Watch list' bullets. No invented facts, no preamble.")},
+                {"role": "user", "content": f"Today: {today.isoformat()}\nPortfolio: {facts['total_contracts']} contracts\n\nFindings:\n{facts_text}"},
+            ],
+            max_tokens=4096,
+            temperature=0.2,
+        )
+        review_md = resp.choices[0].message.content or ""
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Review generation failed: {e}")
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "facts": {k: v for k, v in facts.items() if not isinstance(v, list) or v},
+        "review_markdown": review_md,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Contract families — amendments & related documents
+# ---------------------------------------------------------------------------
+
+RELATIONSHIP_TYPES = {"AMENDS", "AMENDED_BY", "ORDER_UNDER", "MASTER_OF", "RENEWS", "INCORPORATES", "RELATED"}
+
+
+@app.get("/api/v1/contracts/{contract_id}/related")
+async def get_related_documents(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Persisted family links + auto-suggestions from extracted document references."""
+    from .models import ContractRelationship
+    contract = get_accessible_contract(db, contract_id, current_user)
+
+    def project(c: Contract) -> dict:
+        return {"id": str(c.id), "filename": c.filename, "contract_type": c.contract_type,
+                "counterparty": c.counterparty or c.company,
+                "business_unit": c.business_unit,
+                "expiry_date": c.expiry_date.isoformat() if c.expiry_date else None}
+
+    links = []
+    linked_ids = {str(contract.id)}
+    rels = (db.query(ContractRelationship)
+            .filter(or_(ContractRelationship.contract_id == contract.id,
+                        ContractRelationship.related_contract_id == contract.id))
+            .all())
+    for r in rels:
+        other_id = r.related_contract_id if str(r.contract_id) == str(contract.id) else r.contract_id
+        other = db.query(Contract).filter(Contract.id == other_id).first()
+        if not other:
+            continue
+        outbound = str(r.contract_id) == str(contract.id)
+        links.append({
+            "relationship_id": str(r.id),
+            "relationship_type": r.relationship_type if outbound else f"inverse:{r.relationship_type}",
+            "source": r.source,
+            "contract": project(other),
+        })
+        linked_ids.add(str(other_id))
+
+    # Auto-suggestions from the metadata agent's extracted references
+    suggestions = []
+    refs = (contract.metadata_json or {}).get("document_references") or []
+    scope = db.query(Contract).filter(bu_scope_criterion(current_user), Contract.id != contract.id).all()
+    version_family = {(contract.metadata_json or {}).get("parent_contract_id")}
+    for ref in refs[:8]:
+        title_words = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", ref.get("title") or "")}
+        if not title_words:
+            continue
+        best, best_score = None, 0
+        for cand in scope:
+            if str(cand.id) in linked_ids or str(cand.id) in version_family:
+                continue
+            hay = f"{cand.filename} {cand.counterparty or ''} {cand.contract_type or ''}".lower()
+            score = sum(1 for w in title_words if w in hay)
+            if ref.get("doc_type") and cand.contract_type == ref.get("doc_type"):
+                score += 2
+            if score > best_score:
+                best, best_score = cand, score
+        if best is not None and best_score >= 2:
+            rel = ref.get("relationship") or "RELATED"
+            suggestions.append({
+                "reference_title": ref.get("title"),
+                "relationship_type": rel if rel in RELATIONSHIP_TYPES else "RELATED",
+                "confidence_score": best_score,
+                "contract": project(best),
+            })
+            linked_ids.add(str(best.id))
+
+    # Same-counterparty nudge (weakest tier)
+    vendor = (contract.counterparty or "").strip()
+    if vendor:
+        for cand in scope:
+            if str(cand.id) in linked_ids:
+                continue
+            if cand.counterparty and vendor.lower().split(",")[0] in cand.counterparty.lower():
+                suggestions.append({
+                    "reference_title": f"Same counterparty: {vendor}",
+                    "relationship_type": "RELATED",
+                    "confidence_score": 1,
+                    "contract": project(cand),
+                })
+                linked_ids.add(str(cand.id))
+                if len(suggestions) >= 6:
+                    break
+
+    return {"links": links, "suggestions": suggestions[:6]}
+
+
+class RelateIn(BaseModel):
+    related_contract_id: str
+    relationship_type: str = "RELATED"
+
+
+@app.post("/api/v1/contracts/{contract_id}/related")
+async def link_related_document(
+    contract_id: str,
+    payload: RelateIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import ContractRelationship
+    contract = get_accessible_contract(db, contract_id, current_user)
+    other = get_accessible_contract(db, payload.related_contract_id, current_user)
+    rtype = payload.relationship_type if payload.relationship_type in RELATIONSHIP_TYPES else "RELATED"
+    existing = (db.query(ContractRelationship)
+                .filter(ContractRelationship.contract_id == contract.id,
+                        ContractRelationship.related_contract_id == other.id).first())
+    if existing:
+        existing.relationship_type = rtype
+        db.commit()
+        return {"relationship_id": str(existing.id)}
+    rel = ContractRelationship(contract_id=contract.id, related_contract_id=other.id,
+                               relationship_type=rtype, source="user")
+    db.add(rel)
+    db.commit()
+    db.refresh(rel)
+    return {"relationship_id": str(rel.id)}
+
+
+@app.delete("/api/v1/contracts/{contract_id}/related/{relationship_id}")
+async def unlink_related_document(
+    contract_id: str,
+    relationship_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import ContractRelationship
+    get_accessible_contract(db, contract_id, current_user)
+    rel = db.query(ContractRelationship).filter(ContractRelationship.id == relationship_id).first()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Link not found")
+    db.delete(rel)
+    db.commit()
+    return {"message": "Unlinked"}
