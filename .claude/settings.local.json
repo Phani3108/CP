@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker info *)",
+      "Bash(pg_isready)",
+      "Bash(redis-cli ping *)",
+      "Read(//Users/phanitejamarpaka/**)",
+      "Read(//Users/phanitejamarpaka/Library/pnpm/**)",
+      "Read(//Library/Frameworks/Python.framework/**)",
+      "Bash(compgen -c python3)",
+      "Bash(xcode-select -p)"
+    ]
+  }
+}
