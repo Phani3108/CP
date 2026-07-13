@@ -866,3 +866,89 @@ async def analyze_template_deviations(alignment, use_llm: bool = True, status_ca
     kind_weight = {"DELETED": 3, "ADDED": 2, "MODIFIED": 1, "MATCHED": 0}
     items.sort(key=lambda i: (severity.get(i["risk_of_change"], 0), kind_weight.get(i["deviation_type"], 0)), reverse=True)
     return items
+
+
+# ---------------------------------------------------------
+# Agent 6: Metadata Extractor (dynamic + structured)
+# Replaces the brittle regex header parsing with LLM extraction,
+# including open-ended dynamic attributes and document references.
+# ---------------------------------------------------------
+
+CONTRACT_TYPES = ["MSA", "NDA", "SOW", "SLA", "DPA", "LICENSE", "SERVICES",
+                  "PURCHASE", "EMPLOYMENT", "LEASE", "AMENDMENT", "OTHER"]
+
+
+class DynamicAttribute(BaseModel):
+    key: str = Field(description="Short human-readable label, e.g. 'Retainer fee', 'SLA uptime', 'Carve-out list'")
+    value: str = Field(description="The extracted value as concise text")
+    category: str = Field(default="general", description="One of: financial, dates, legal, operational, general")
+
+
+class DocumentReference(BaseModel):
+    title: str = Field(description="How the referenced document is named in the text, e.g. 'Replit Commercial Agreement'")
+    doc_type: str | None = Field(default=None, description=f"Best-guess type, one of: {', '.join(CONTRACT_TYPES)}")
+    relationship: str = Field(default="RELATED", description="One of: AMENDS, AMENDED_BY, ORDER_UNDER, MASTER_OF, RENEWS, INCORPORATES, RELATED")
+    date_mentioned: str | None = Field(default=None, description="ISO date if the reference cites one")
+
+
+class ContractMetadataResult(BaseModel):
+    party_a: str | None = Field(default=None, description="First/issuing party legal name")
+    party_b: str | None = Field(default=None, description="Counterparty legal name")
+    counterparty_role: str | None = Field(default=None, description="One of: vendor, customer, partner, unknown")
+    contract_type: str | None = Field(default=None, description=f"Normalized type, exactly one of: {', '.join(CONTRACT_TYPES)}")
+    effective_date: str | None = Field(default=None, description="ISO YYYY-MM-DD")
+    expiry_date: str | None = Field(default=None, description="ISO YYYY-MM-DD; if only a term is stated, compute from effective_date when possible")
+    term_description: str | None = None
+    term_months: int | None = None
+    auto_renewal: bool | None = None
+    renewal_notice_days: int | None = None
+    total_value: float | None = Field(default=None, description="Total committed contract value as a plain number")
+    currency: str | None = Field(default=None, description="ISO 4217 code, e.g. USD")
+    payment_terms: str | None = Field(default=None, description="e.g. 'Net 45'")
+    governing_law: str | None = Field(default=None, description="e.g. 'New York' or 'Delaware'")
+    business_unit_hint: str | None = Field(default=None, description="Business unit/division mentioned, if any")
+    rfq_reference: str | None = Field(default=None, description="RFQ/RFP/PO/sourcing-event reference number if stated, else null")
+    dynamic_attributes: list[DynamicAttribute] = Field(default_factory=list, description="Up to 10 additional contract-specific facts worth surfacing that do not fit the fixed fields")
+    references_other_documents: list[DocumentReference] = Field(default_factory=list, description="Other agreements/documents this contract references (masters, amendments, order forms, exhibits incorporated by reference)")
+    confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+
+
+metadata_agent = Agent(
+    os.getenv("OPENAI_MODEL_METADATA", os.getenv("OPENAI_MODEL_RISK", "openai:gpt-4.1")),
+    output_type=ContractMetadataResult,
+    retries=3,
+    system_prompt=(
+        "You are a contract metadata extraction specialist for an enterprise contract repository. "
+        "Extract ONLY facts stated in the text; use null when a field is absent — never guess. "
+        "Dates must be ISO YYYY-MM-DD. Normalize contract_type to the provided enum (the overall "
+        "instrument type — an order form under a master agreement is PURCHASE; the master itself is MSA). "
+        "total_value is the total committed value (sum line items if itemized), not a unit price. "
+        "auto_renewal is true whenever the agreement provides ANY automatic renewal mechanism "
+        "(e.g. 'automatically renewed for successive one-year terms'), even if the initial term "
+        "itself is defined in a separate order form; false only when renewal is explicitly manual. "
+        "dynamic_attributes: surface up to 10 additional contract-specific facts a procurement or legal "
+        "reviewer would want at a glance (fees, caps, SLAs, carve-outs, key deadlines, named personnel, "
+        "special rights) — concise values, no duplication of the fixed fields. "
+        "references_other_documents: list other agreements this document explicitly references "
+        "(the master it operates under, documents it amends or renews, incorporated terms), with the "
+        "relationship seen FROM THIS DOCUMENT (e.g. an order form ORDER_UNDER its master). "
+        "rfq_reference: any RFQ/RFP/PO/sourcing event number; null if none is stated."
+    )
+)
+
+
+async def extract_contract_metadata_llm(raw_text: str) -> ContractMetadataResult:
+    """Run the metadata extractor on the document (bounded context).
+
+    Gemini Flash handles large contexts cheaply — send up to ~90K chars whole;
+    beyond that, head + middle + tail sampling so deep clauses (governing law,
+    payment terms) aren't silently cut.
+    """
+    text = raw_text or ""
+    if len(text) <= 90000:
+        snippet = text
+    else:
+        mid = len(text) // 2
+        snippet = text[:45000] + "\n...\n" + text[mid - 10000:mid + 10000] + "\n...\n" + text[-20000:]
+    run = await metadata_agent.run(snippet)
+    return run.output

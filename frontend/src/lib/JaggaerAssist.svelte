@@ -12,7 +12,7 @@
 
 {#if !onAssistPage}
 	{#if !assist.open}
-		<button class="assist-fab" type="button" onclick={() => (assist.open = true)} aria-label="Open Jaggaer Assist">
+		<button class="assist-fab" type="button" onclick={() => assist.toggle()} aria-label="Open Jaggaer Assist">
 			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a4 4 0 0 1-4 4H7l-4 4V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/></svg>
 		</button>
 	{/if}

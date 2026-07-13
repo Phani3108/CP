@@ -16,6 +16,13 @@
 		metadata_json?: any;
 		overall_risk?: string | null;
 		created_at: string;
+		company?: string | null;
+		counterparty?: string | null;
+		contract_type?: string | null;
+		expiry_date?: string | null;
+		total_value?: number | null;
+		currency?: string | null;
+		completeness_score?: number | null;
 	};
 
 	let contracts: ContractSummary[] = $state(initialContracts || []);
@@ -35,6 +42,130 @@
 	let contractToDelete = $state<string | null>(null);
 	let pasteModalOpen = $state(false);
 	let pastedText = $state('');
+
+	// ---- Smart (natural-language) search ----
+	type SavedSearchItem = { id: string; name: string; question: string | null; filters: any };
+	let searchMode = $state<'filter' | 'smart'>('filter');
+	let smartQuery = $state('');
+	let smartLoading = $state(false);
+	let smartActive = $state(false);
+	let smartResults = $state<ContractSummary[]>([]);
+	let smartFilters = $state<Record<string, any>>({});
+	let smartExplanation = $state('');
+	let lastSmartQuestion = $state('');
+	let savedSearches = $state<SavedSearchItem[]>([]);
+	let savedLoaded = $state(false);
+
+	async function loadSavedSearches() {
+		if (savedLoaded) return;
+		try {
+			const res = await apiFetch('/api/v1/saved-searches');
+			if (res.ok) {
+				const d = await res.json();
+				savedSearches = d.saved_searches || [];
+				savedLoaded = true;
+			}
+		} catch { /* non-fatal */ }
+	}
+
+	function enterSmartMode() {
+		searchMode = 'smart';
+		void loadSavedSearches();
+	}
+
+	async function runSmartSearch(question?: string) {
+		const q = (question ?? smartQuery).trim();
+		if (!q || smartLoading) return;
+		smartQuery = q;
+		smartLoading = true;
+		try {
+			const res = await apiFetch('/api/v1/search/query', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ question: q, limit: 50 })
+			});
+			const d = await res.json().catch(() => ({}));
+			if (!res.ok) throw new Error(d?.detail || 'Search failed');
+			smartResults = (d.results || []).map((r: any) => ({
+				...r,
+				metadata_json: { risk_counts: {} }
+			}));
+			smartFilters = d.filters_applied || {};
+			smartExplanation = d.explanation || '';
+			lastSmartQuestion = q;
+			smartActive = true;
+			if (d.route === 'fallback_ilike') {
+				toast.info('AI parse unavailable — showing keyword matches');
+			}
+		} catch (e: any) {
+			toast.error(e?.message || 'Smart search failed');
+		} finally {
+			smartLoading = false;
+		}
+	}
+
+	function clearSmartSearch() {
+		smartActive = false;
+		smartResults = [];
+		smartFilters = {};
+		smartExplanation = '';
+		smartQuery = '';
+	}
+
+	async function saveCurrentSearch() {
+		if (!lastSmartQuestion) return;
+		const name = prompt('Name this search:', lastSmartQuestion.slice(0, 50));
+		if (!name) return;
+		try {
+			const res = await apiFetch('/api/v1/saved-searches', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, question: lastSmartQuestion, filters: smartFilters })
+			});
+			if (!res.ok) throw new Error('Save failed');
+			toast.success('Search saved');
+			savedLoaded = false;
+			await loadSavedSearches();
+		} catch (e: any) {
+			toast.error(e?.message || 'Save failed');
+		}
+	}
+
+	async function removeSavedSearch(s: SavedSearchItem) {
+		try {
+			await apiFetch(`/api/v1/saved-searches/${s.id}`, { method: 'DELETE' });
+			savedSearches = savedSearches.filter((x) => x.id !== s.id);
+		} catch { /* best effort */ }
+	}
+
+	function formatFilterChip(key: string, value: any): string {
+		const label = key.replace(/_/g, ' ');
+		if (Array.isArray(value)) return `${label}: ${value.join(', ')}`;
+		if (typeof value === 'boolean') return value ? label : `not ${label}`;
+		if (typeof value === 'number' && (key.includes('value'))) return `${label}: ${value.toLocaleString()}`;
+		return `${label}: ${value}`;
+	}
+
+	// ---- Business units (intake tagging) ----
+	type BUItem = { id: string; name: string };
+	let businessUnits = $state<BUItem[]>([]);
+	let selectedBuId = $state('');
+
+	async function loadBusinessUnits() {
+		if (businessUnits.length > 0) return;
+		try {
+			const res = await apiFetch('/api/v1/business-units');
+			if (res.ok) {
+				const d = await res.json();
+				businessUnits = d.business_units || [];
+			}
+		} catch { /* non-fatal */ }
+	}
+
+	function formatValue(v: number | null | undefined, cur: string | null | undefined): string {
+		if (v == null) return '—';
+		return `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 })} ${cur || ''}`.trim();
+	}
 
 	function groupLatestContracts(all: ContractSummary[]): ContractSummary[] {
 		if (!all || all.length === 0) return [];
@@ -107,17 +238,24 @@
 	// Derived filtered contracts
 	let filteredContracts = $derived(
 		latestContracts.filter(c => {
-			const matchesSearch = c.filename.toLowerCase().includes(searchQuery.toLowerCase());
+			const term = searchQuery.toLowerCase();
+			const matchesSearch =
+				c.filename.toLowerCase().includes(term) ||
+				(c.counterparty || '').toLowerCase().includes(term) ||
+				(c.company || c.metadata_json?.company || '').toLowerCase().includes(term);
 			const matchesStatus = statusFilter === 'ALL' || c.status === statusFilter;
-			
+
 			let matchesRisk = true;
 			if (riskFilter !== 'ALL') {
 				matchesRisk = c.status === 'COMPLETED' && c.overall_risk === riskFilter;
 			}
-			
+
 			return matchesSearch && matchesStatus && matchesRisk;
 		})
 	);
+
+	// Table rows: smart-search results replace the normal filtered list
+	let displayedContracts = $derived(smartActive ? smartResults : filteredContracts);
 
 	async function fetchContracts(silent = false) {
 		if (!silent) isLoading = true;
@@ -206,7 +344,7 @@
 	function uploadOne(item: UploadItem): Promise<void> {
 		return new Promise((resolve) => {
 			const xhr = new XMLHttpRequest();
-			xhr.open('POST', `${getApiBase()}/api/v1/contracts/upload`);
+			xhr.open('POST', `${getApiBase()}/api/v1/contracts/upload${selectedBuId ? `?business_unit_id=${selectedBuId}` : ''}`);
 			if (authState.token) xhr.setRequestHeader('Authorization', `Bearer ${authState.token}`);
 			xhr.upload.onprogress = (e) => {
 				if (e.lengthComputable) updateItem(item.id, { progress: Math.round((e.loaded / e.total) * 100) });
@@ -305,7 +443,7 @@
 			const response = await apiFetch('/api/v1/contracts/text', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ text })
+				body: JSON.stringify({ text, business_unit_id: selectedBuId || null })
 			});
 
 			if (response.ok) {
@@ -419,6 +557,7 @@
 	}
 
 	onMount(() => {
+		void loadBusinessUnits();
 		const u = new URL(window.location.href);
 		apiBase = `${u.protocol}//${u.hostname}:9432`;
 		// Load already populated via `+page.ts`, but keep a fast refresh + polling.
@@ -506,16 +645,40 @@
 	<!-- Dashboard Advanced Filters -->
 	<div class="filters-panel panel bg-panel-glow">
 		<div class="filters-layout">
-			<!-- Realtime Search -->
+			<!-- Mode toggle: plain filter vs natural-language smart search -->
+			<div class="filter-pills flex-row gap-4" role="tablist" aria-label="Search mode">
+				<button class="filter-pill" class:active={searchMode === 'filter'} onclick={() => { searchMode = 'filter'; clearSmartSearch(); }}>Filter</button>
+				<button class="filter-pill smart-pill" class:active={searchMode === 'smart'} onclick={enterSmartMode}>
+					<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l1.2 4.3L18 8l-4.8 1.7L12 14l-1.2-4.3L6 8l4.8-1.7L12 2z"/></svg>
+					Smart search
+				</button>
+			</div>
+
+			<!-- Realtime Search / NL question -->
 			<div class="search-input-wrapper">
-				<svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-				<input 
-					type="text" 
-					placeholder="Search files by name..." 
-					bind:value={searchQuery}
-					class="contract-search-bar"
-					aria-label="Search contracts by name"
-				/>
+				{#if smartLoading}
+					<span class="spinner spinner-sm search-icon"></span>
+				{:else}
+					<svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+				{/if}
+				{#if searchMode === 'smart'}
+					<input
+						type="text"
+						placeholder="Ask: auto-renewing MSAs over $100K expiring before 2027…"
+						bind:value={smartQuery}
+						class="contract-search-bar"
+						aria-label="Natural language contract search"
+						onkeydown={(e) => { if (e.key === 'Enter') runSmartSearch(); }}
+					/>
+				{:else}
+					<input
+						type="text"
+						placeholder="Search by name, vendor…"
+						bind:value={searchQuery}
+						class="contract-search-bar"
+						aria-label="Search contracts by name"
+					/>
+				{/if}
 			</div>
 
 			<!-- Status Filter Pills -->
@@ -541,13 +704,45 @@
 				</div>
 			</div>
 		</div>
+
+		{#if searchMode === 'smart' && (smartActive || savedSearches.length > 0)}
+			<div class="smart-strip">
+				{#if smartActive}
+					<div class="smart-chips">
+						{#each Object.entries(smartFilters) as [k, v] (k)}
+							<span class="badge badge-blue">{formatFilterChip(k, v)}</span>
+						{/each}
+						{#if Object.keys(smartFilters).length === 0}
+							<span class="badge badge-secondary">no structured filters parsed</span>
+						{/if}
+						<button class="btn-inline smart-action" onclick={saveCurrentSearch} title="Save this search for reuse">Save search</button>
+						<button class="btn-inline smart-action" onclick={clearSmartSearch}>Clear</button>
+					</div>
+					{#if smartExplanation}
+						<div class="smart-explanation text-tertiary">{smartExplanation} — {smartResults.length} result{smartResults.length === 1 ? '' : 's'}</div>
+					{/if}
+				{/if}
+				{#if savedSearches.length > 0}
+					<div class="smart-chips saved-row">
+						<span class="filter-group-label">Saved:</span>
+						{#each savedSearches as s (s.id)}
+							<span class="saved-chip">
+								<button class="saved-chip-run" onclick={() => runSmartSearch(s.question || s.name)} title={s.question || s.name}>{s.name}</button>
+								<button class="saved-chip-x" onclick={() => removeSavedSearch(s)} aria-label="Delete saved search">×</button>
+							</span>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
 	</div>
 
 	<!-- Portfolio Table Panel -->
 	<div class="data-table panel">
 		<div class="table-header">
 			<div class="col col-name">Document</div>
-			<div class="col col-vendor">Vendor</div>
+			<div class="col col-vendor">Counterparty</div>
+			<div class="col col-terms">Terms</div>
 			<div class="col col-status">Status</div>
 			<div class="col col-risk">Severity Bar</div>
 			<div class="col col-date">Uploaded</div>
@@ -565,13 +760,13 @@
 					<div class="col col-actions"><div class="skeleton" style="height: 14px; width: 22px; margin-left: auto;"></div></div>
 				</div>
 			{/each}
-		{:else if filteredContracts.length === 0}
+		{:else if displayedContracts.length === 0}
 			<div class="table-row empty-row">
-				No contracts found matching filter criteria.
+				{smartActive ? 'No contracts match this search — try rephrasing the question.' : 'No contracts found matching filter criteria.'}
 			</div>
 		{/if}
 
-		{#each filteredContracts as contract, i}
+		{#each displayedContracts as contract, i (contract.id)}
 			<div
 				class="table-row clickable-row stagger-entry"
 				class:processing-row={contract.status === 'PROCESSING'}
@@ -603,9 +798,28 @@
 					{/if}
 				</div>
 
-				<!-- Vendor -->
-				<div class="col col-vendor" title={contract.metadata_json?.company || ''}>
-					<span class="vendor-text">{contract.metadata_json?.company || '—'}</span>
+				<!-- Counterparty -->
+				<div class="col col-vendor" title={contract.counterparty || contract.company || contract.metadata_json?.company || ''}>
+					<span class="vendor-text">{contract.counterparty || contract.company || contract.metadata_json?.company || '—'}</span>
+				</div>
+
+				<!-- Terms: type · value · expiry · completeness -->
+				<div class="col col-terms">
+					<div class="terms-line">
+						{#if contract.contract_type}<span class="badge badge-blue badge-sm">{contract.contract_type}</span>{/if}
+						<span class="terms-value">{formatValue(contract.total_value, contract.currency)}</span>
+					</div>
+					<div class="terms-line terms-sub">
+						<span title="Expiry date">{contract.expiry_date ? `exp ${contract.expiry_date}` : 'no expiry'}</span>
+						{#if contract.completeness_score != null}
+							<span
+								class="completeness-dot"
+								class:good={contract.completeness_score >= 0.7}
+								class:mid={contract.completeness_score >= 0.4 && contract.completeness_score < 0.7}
+								title="Metadata completeness: {Math.round((contract.completeness_score || 0) * 100)}%"
+							></span>
+						{/if}
+					</div>
 				</div>
 
 				<!-- Status Badge -->
@@ -756,6 +970,14 @@
 			</div>
 			<div class="modal-footer flex-end gap-12">
 				<button class="btn btn-secondary" onclick={() => pasteModalOpen = false}>Cancel</button>
+				{#if businessUnits.length > 0}
+					<select class="bu-select" bind:value={selectedBuId} aria-label="Business unit">
+						<option value="">My unit (default)</option>
+						{#each businessUnits as b (b.id)}
+							<option value={b.id}>{b.name}</option>
+						{/each}
+					</select>
+				{/if}
 				<button class="btn btn-primary" onclick={handlePasteAnalyze} disabled={isUploading}>
 					{#if isUploading}
 						<span class="spinner spinner-sm"></span> Analyzing...
@@ -795,6 +1017,19 @@
 					<svg class="dropzone-icon" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
 					<p class="dropzone-title">{isDragging ? 'Drop to upload' : 'Drag & drop PDF contracts here'}</p>
 					<p class="dropzone-sub text-tertiary">or <span class="dropzone-link">browse files</span> · PDF only · up to {formatBytes(MAX_UPLOAD_BYTES)} each</p>
+				</button>
+				{#if businessUnits.length > 0}
+					<div class="bu-select-row">
+						<label class="filter-group-label" for="bu-select-upload">Business unit:</label>
+						<select id="bu-select-upload" class="bu-select" bind:value={selectedBuId}>
+							<option value="">My unit (default)</option>
+							{#each businessUnits as b (b.id)}
+								<option value={b.id}>{b.name}</option>
+							{/each}
+						</select>
+					</div>
+				{/if}
+				<button type="button" class="hidden-marker" style="display:none">
 				</div>
 
 				{#if uploadItems.length > 0}
@@ -1478,4 +1713,137 @@
 			opacity: 1;
 		}
 	}
+
+	/* ------------------------------------------------------------
+	   Smart search strip + terms column
+	   ------------------------------------------------------------- */
+	.smart-pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+	}
+	.smart-strip {
+		border-top: 1px solid var(--border-subtle);
+		padding: 10px 16px 12px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.smart-chips {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+	.smart-explanation {
+		font-size: 12px;
+	}
+	.smart-action {
+		background: transparent;
+		border: none;
+		color: var(--accent-primary);
+		font-size: 12px;
+		font-weight: 500;
+		cursor: pointer;
+		padding: 2px 8px;
+		border-radius: var(--radius-pill);
+	}
+	.smart-action:hover {
+		background: rgba(0, 113, 227, 0.08);
+	}
+	.saved-row {
+		padding-top: 2px;
+	}
+	.saved-chip {
+		display: inline-flex;
+		align-items: center;
+		background: var(--bg-hover);
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-pill);
+		overflow: hidden;
+	}
+	.saved-chip-run {
+		background: transparent;
+		border: none;
+		padding: 4px 4px 4px 12px;
+		font-size: 12px;
+		color: var(--text-primary);
+		cursor: pointer;
+		max-width: 200px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.saved-chip-x {
+		background: transparent;
+		border: none;
+		color: var(--text-tertiary);
+		cursor: pointer;
+		padding: 4px 8px 4px 4px;
+		font-size: 13px;
+		line-height: 1;
+	}
+	.saved-chip-x:hover {
+		color: var(--color-critical-text);
+	}
+	.col-terms {
+		flex: 2;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.terms-line {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+	.terms-value {
+		font-size: 12px;
+		font-variant-numeric: tabular-nums;
+		color: var(--text-secondary);
+		white-space: nowrap;
+	}
+	.terms-sub {
+		font-size: 11px;
+		color: var(--text-tertiary);
+	}
+	.completeness-dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--color-critical);
+		flex-shrink: 0;
+	}
+	.completeness-dot.mid {
+		background: var(--color-high);
+	}
+	.completeness-dot.good {
+		background: var(--color-low);
+	}
+
+
+	.bu-select-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.bu-select {
+		height: 34px;
+		padding: 0 12px;
+		border-radius: var(--radius-md);
+		border: 1.5px solid var(--border-subtle);
+		background: var(--bg-hover);
+		color: var(--text-primary);
+		font-size: 12.5px;
+		outline: none;
+	}
+	.bu-select:focus {
+		border-color: var(--accent-primary);
+		background: #fff;
+		box-shadow: var(--ring);
+	}
+
 </style>

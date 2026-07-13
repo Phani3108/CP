@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Enum, Boolean, Integer
+from sqlalchemy import Column, String, DateTime, Date, ForeignKey, Text, Enum, Boolean, Integer, Numeric, Float
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
@@ -8,12 +8,33 @@ import enum
 
 from .database import Base
 
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BusinessUnit(Base):
+    __tablename__ = "business_units"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
+    business_unit_id = Column(UUID(as_uuid=True), ForeignKey("business_units.id"), nullable=True)
+    role = Column(String, nullable=False, default="member")  # member | bu_admin | org_admin
     created_at = Column(DateTime, default=datetime.utcnow)
 
     contracts = relationship("Contract", back_populates="user", cascade="all, delete-orphan")
@@ -38,10 +59,27 @@ class Contract(Base):
     file_hash = Column(String, index=True, nullable=True)
     status = Column(Enum(ContractStatus), default=ContractStatus.PENDING)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
-    
+
+    # Promoted, queryable business metadata (dual-written with metadata_json).
+    # Nullable throughout: values are best-effort LLM/regex extractions.
+    company = Column(String, nullable=True)             # party A / our side
+    counterparty = Column(String, nullable=True)        # party B / vendor
+    contract_type = Column(String, nullable=True)       # normalized enum-ish (MSA, NDA, ...)
+    effective_date = Column(Date, nullable=True)
+    expiry_date = Column(Date, nullable=True)
+    auto_renewal = Column(Boolean, nullable=True)
+    renewal_notice_days = Column(Integer, nullable=True)
+    total_value = Column(Numeric(14, 2), nullable=True)
+    currency = Column(String(3), nullable=True)
+    payment_terms = Column(String, nullable=True)
+    governing_law = Column(String, nullable=True)
+    business_unit = Column(String, nullable=True)
+    business_unit_id = Column(UUID(as_uuid=True), ForeignKey("business_units.id"), nullable=True, index=True)
+    completeness_score = Column(Float, nullable=True)
+
     # Store aggregated analysis like overall risk score, key obligations, etc.
     metadata_json = Column(JSONB, default={})
-    
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -158,4 +196,39 @@ class TemplateClause(Base):
     position_index = Column(Integer, default=0)
 
     embedding = Column(Vector(1536), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AssistConversation(Base):
+    """Server-persisted Jaggaer Assist conversation — owned by a user."""
+    __tablename__ = "assist_conversations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=False, default="New conversation")
+    context_contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AssistMessage(Base):
+    __tablename__ = "assist_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("assist_conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String, nullable=False)  # user | assistant
+    content = Column(Text, nullable=False)
+    meta_json = Column(JSONB, default={})  # sources/actions/suggested_questions/route/query_scope
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SavedSearch(Base):
+    """Named, reusable repository search — the 'standard search process'."""
+    __tablename__ = "saved_searches"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    question = Column(Text, nullable=True)      # original NL question, if any
+    filters_json = Column(JSONB, default={})    # validated filter set to re-execute
     created_at = Column(DateTime, default=datetime.utcnow)

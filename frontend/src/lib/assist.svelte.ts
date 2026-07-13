@@ -19,6 +19,18 @@ export type AssistSource = {
 
 export type AssistMeta = { route?: string; query_scope?: string; conversation_mode?: string };
 
+export type AssistResultRow = {
+	id: string;
+	filename: string;
+	counterparty?: string | null;
+	company?: string | null;
+	contract_type?: string | null;
+	expiry_date?: string | null;
+	total_value?: number | null;
+	currency?: string | null;
+	business_unit?: string | null;
+};
+
 export type AssistMsg = {
 	role: 'user' | 'assistant';
 	content: string;
@@ -26,30 +38,55 @@ export type AssistMsg = {
 	sources?: AssistSource[];
 	actions?: AssistAction[];
 	suggested?: string[];
+	results?: AssistResultRow[];
 	meta?: AssistMeta;
 };
 
 export type Conversation = {
-	id: string;
+	id: string;              // server uuid once known; "local-…" before first send
 	title: string;
 	updatedAt: number;
 	messages: AssistMsg[];
 	sessionId?: string;
+	serverId?: string | null;
+	loaded: boolean;         // messages hydrated from server
+	messageCount?: number;
+	contextContractId?: string | null;
 };
 
-const CONVOS_KEY = 'cp_assist_convos';
+export type AssistPageContext = { contract_id: string; contract_name?: string } | null;
+
 const MODE_KEY = 'cp_assist_mode';
 const browser = typeof window !== 'undefined';
 
 function uid(): string {
-	return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+	return 'local-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
 export const STARTER_QUESTIONS = [
-	'How many contracts expire before 2026?',
+	'How many contracts expire before 2027?',
 	'Compare termination clauses across all contracts',
 	'Which contracts have auto-renewal?'
 ];
+
+export const STARTER_QUESTIONS_CONTRACT = [
+	'Summarize the riskiest clauses in this contract',
+	'What are the termination terms here?',
+	'Does this auto-renew, and what is the notice window?'
+];
+
+function msgFromServer(m: any): AssistMsg {
+	const meta = m.meta_json || {};
+	return {
+		role: m.role,
+		content: m.content,
+		sources: meta.sources || [],
+		actions: meta.actions || [],
+		suggested: meta.suggested_questions || [],
+		results: meta.results || [],
+		meta: { route: meta.route, query_scope: meta.query_scope }
+	};
+}
 
 class AssistState {
 	open = $state(false);
@@ -58,20 +95,13 @@ class AssistState {
 	conversations = $state<Conversation[]>([]);
 	activeId = $state<string | null>(null);
 	loading = $state(false);
+	listLoaded = $state(false);
+	pageContext = $state<AssistPageContext>(null);
 
 	constructor() {
 		if (browser) {
-			try {
-				const raw = localStorage.getItem(CONVOS_KEY);
-				if (raw) this.conversations = JSON.parse(raw);
-			} catch {
-				this.conversations = [];
-			}
 			const m = localStorage.getItem(MODE_KEY);
 			if (m === 'docked' || m === 'floater') this.mode = m;
-			if (this.conversations.length > 0) {
-				this.activeId = [...this.conversations].sort((a, b) => b.updatedAt - a.updatedAt)[0].id;
-			}
 		}
 	}
 
@@ -83,15 +113,8 @@ class AssistState {
 		return this.conversations.find((c) => c.id === this.activeId) ?? null;
 	}
 
-	persist() {
-		if (!browser) return;
-		try {
-			// keep the 30 most recent, cap stored messages per convo
-			const slim = this.sorted.slice(0, 30).map((c) => ({ ...c, messages: c.messages.slice(-60) }));
-			localStorage.setItem(CONVOS_KEY, JSON.stringify(slim));
-		} catch {
-			/* storage full — ignore */
-		}
+	setPageContext(ctx: AssistPageContext) {
+		this.pageContext = ctx;
 	}
 
 	setMode(mode: 'floater' | 'docked') {
@@ -102,24 +125,78 @@ class AssistState {
 
 	toggle() {
 		this.open = !this.open;
+		if (this.open) void this.ensureLoaded();
+	}
+
+	/** Hydrate the conversation rail from the server (once per session). */
+	async ensureLoaded(): Promise<void> {
+		if (this.listLoaded) return;
+		try {
+			const res = await apiFetch('/api/v1/conversations');
+			if (!res.ok) return;
+			const data = await res.json();
+			const locals = this.conversations.filter((c) => !c.serverId && c.messages.length > 0);
+			this.conversations = [
+				...locals,
+				...(data.conversations || []).map((c: any) => ({
+					id: c.id,
+					serverId: c.id,
+					title: c.title,
+					updatedAt: c.updated_at ? new Date(c.updated_at).getTime() : Date.now(),
+					messages: [],
+					loaded: false,
+					messageCount: c.message_count,
+					contextContractId: c.context_contract_id
+				}))
+			];
+			this.listLoaded = true;
+			if (!this.activeId && this.sorted.length > 0) this.activeId = this.sorted[0].id;
+		} catch {
+			/* offline — rail stays empty */
+		}
+	}
+
+	async setActive(id: string) {
+		this.activeId = id;
+		const convo = this.conversations.find((c) => c.id === id);
+		if (!convo || convo.loaded || !convo.serverId) return;
+		try {
+			const res = await apiFetch(`/api/v1/conversations/${convo.serverId}`);
+			if (!res.ok) return;
+			const data = await res.json();
+			convo.messages = (data.messages || []).map(msgFromServer);
+			convo.loaded = true;
+			this.conversations = [...this.conversations];
+		} catch {
+			/* keep unloaded */
+		}
 	}
 
 	newConversation(): Conversation {
-		const convo: Conversation = { id: uid(), title: 'New conversation', updatedAt: Date.now(), messages: [] };
+		const convo: Conversation = {
+			id: uid(),
+			serverId: null,
+			title: 'New conversation',
+			updatedAt: Date.now(),
+			messages: [],
+			loaded: true
+		};
 		this.conversations = [convo, ...this.conversations];
 		this.activeId = convo.id;
-		this.persist();
 		return convo;
 	}
 
-	setActive(id: string) {
-		this.activeId = id;
-	}
-
-	deleteConversation(id: string) {
+	async deleteConversation(id: string) {
+		const convo = this.conversations.find((c) => c.id === id);
+		if (convo?.serverId) {
+			try {
+				await apiFetch(`/api/v1/conversations/${convo.serverId}`, { method: 'DELETE' });
+			} catch {
+				/* best effort */
+			}
+		}
 		this.conversations = this.conversations.filter((c) => c.id !== id);
 		if (this.activeId === id) this.activeId = this.sorted[0]?.id ?? null;
-		this.persist();
 	}
 
 	private ensureActive(): Conversation {
@@ -128,29 +205,17 @@ class AssistState {
 
 	private touch(convo: Conversation) {
 		convo.updatedAt = Date.now();
-		// reassign to trigger reactivity on the array
 		this.conversations = [...this.conversations];
-		this.persist();
-	}
-
-	/** Remove a trailing errored assistant turn (used by resend). */
-	popLastAssistantIfError(convo: Conversation) {
-		const last = convo.messages[convo.messages.length - 1];
-		if (last && last.role === 'assistant' && last.error) {
-			convo.messages = convo.messages.slice(0, -1);
-		}
 	}
 
 	async send(text: string): Promise<void> {
 		const q = (text || '').trim();
 		if (!q || this.loading) return;
+		void this.ensureLoaded();
 		const convo = this.ensureActive();
-		if (convo.messages.length === 0) {
+		if (convo.messages.length === 0 && convo.title === 'New conversation') {
 			convo.title = q.length > 44 ? q.slice(0, 44) + '…' : q;
 		}
-		const history = convo.messages
-			.filter((m) => !m.error)
-			.map((m) => ({ role: m.role, content: m.content }));
 		convo.messages = [...convo.messages, { role: 'user', content: q }];
 		this.touch(convo);
 		this.loading = true;
@@ -158,11 +223,23 @@ class AssistState {
 			const res = await apiFetch('/api/v1/assistant/chat', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ question: q, history, session_id: convo.sessionId })
+				body: JSON.stringify({
+					question: q,
+					session_id: convo.sessionId,
+					conversation_id: convo.serverId,
+					context: this.pageContext ?? undefined
+				})
 			});
 			const json = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(json?.detail || 'Assistant request failed');
 			if (json.session_id) convo.sessionId = json.session_id;
+			if (json.conversation_id && !convo.serverId) {
+				convo.serverId = json.conversation_id;
+				const oldId = convo.id;
+				convo.id = json.conversation_id;
+				if (this.activeId === oldId) this.activeId = convo.id;
+			}
+			convo.loaded = true;
 			convo.messages = [
 				...convo.messages,
 				{
@@ -171,6 +248,7 @@ class AssistState {
 					sources: json.sources || [],
 					actions: json.actions || [],
 					suggested: json.suggested_questions || [],
+					results: json.results || [],
 					meta: {
 						route: json.route,
 						query_scope: json.query_scope,
@@ -192,10 +270,12 @@ class AssistState {
 	async resend(): Promise<void> {
 		const convo = this.active;
 		if (!convo) return;
-		this.popLastAssistantIfError(convo);
+		const last = convo.messages[convo.messages.length - 1];
+		if (last && last.role === 'assistant' && last.error) {
+			convo.messages = convo.messages.slice(0, -1);
+		}
 		const lastUser = [...convo.messages].reverse().find((m) => m.role === 'user');
 		if (!lastUser) return;
-		// drop the trailing user turn too — send() re-adds it
 		const idx = convo.messages.lastIndexOf(lastUser);
 		convo.messages = convo.messages.slice(0, idx);
 		this.touch(convo);

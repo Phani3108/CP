@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
-	import { assist, STARTER_QUESTIONS, type AssistAction, type AssistMsg, type AssistSource } from '$lib/assist.svelte';
+	import { assist, STARTER_QUESTIONS, STARTER_QUESTIONS_CONTRACT, type AssistAction, type AssistMsg, type AssistSource } from '$lib/assist.svelte';
 	import { toast } from '$lib/toastStore';
 
 	let { compact = false }: { compact?: boolean } = $props();
@@ -13,6 +13,13 @@
 	let textareaEl: HTMLTextAreaElement | undefined = $state();
 
 	const messages = $derived(assist.active?.messages ?? []);
+	const starters = $derived(assist.pageContext ? STARTER_QUESTIONS_CONTRACT : STARTER_QUESTIONS);
+	const contextName = $derived.by(() => {
+		const ctx = assist.pageContext;
+		if (!ctx) return null;
+		const name = ctx.contract_name || 'this contract';
+		return name.length > 34 ? name.slice(0, 34) + '…' : name;
+	});
 	const lastSuggested = $derived.by(() => {
 		const last = messages[messages.length - 1];
 		return last?.role === 'assistant' && !last.error ? (last.suggested ?? []) : [];
@@ -113,7 +120,7 @@
 				<h2 class="empty-title">Ask about your contracts</h2>
 				<p class="empty-sub">Query payment terms, compare clauses, check expiry dates, and more.</p>
 				<div class="starter-grid">
-					{#each STARTER_QUESTIONS as q (q)}
+					{#each starters as q (q)}
 						<button type="button" class="starter-chip" onclick={() => submit(q)}>{q}</button>
 					{/each}
 				</div>
@@ -144,6 +151,29 @@
 							<button type="button" class="btn btn-secondary resend-btn" onclick={() => assist.resend()}>Resend message</button>
 						{:else if m.role === 'assistant'}
 							<div class="chat-markdown">{@html renderMarkdown(m.content)}</div>
+							{#if m.results && m.results.length > 0}
+								<div class="results-table-wrap">
+									<table class="results-table">
+										<thead>
+											<tr><th>Contract</th><th>Counterparty</th><th>Type</th><th>Expiry</th><th>Value</th></tr>
+										</thead>
+										<tbody>
+											{#each m.results.slice(0, 8) as r (r.id)}
+												<tr onclick={() => goto(`/contracts/${r.id}`)}>
+													<td class="rt-name">{r.filename}</td>
+													<td>{r.counterparty || r.company || '—'}</td>
+													<td>{r.contract_type || '—'}</td>
+													<td>{r.expiry_date || '—'}</td>
+													<td>{r.total_value != null ? `${Number(r.total_value).toLocaleString()} ${r.currency || ''}` : '—'}</td>
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+									{#if m.results.length > 8}
+										<div class="rt-more">+ {m.results.length - 8} more — refine the question to narrow down</div>
+									{/if}
+								</div>
+							{/if}
 							{#if m.actions && m.actions.length > 0}
 								<div class="action-row">
 									{#each m.actions as a (a.type + (a.contract_id ?? '') + a.label)}
@@ -219,6 +249,23 @@
 		{/if}
 	</div>
 
+	{#if contextName}
+		<div class="context-bar">
+			<span class="context-chip">
+				<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+				Viewing: {contextName}
+				<button
+					type="button"
+					class="context-clear"
+					title="Ask portfolio-wide instead"
+					aria-label="Clear contract context"
+					onclick={() => assist.setPageContext(null)}
+				>
+					<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+				</button>
+			</span>
+		</div>
+	{/if}
 	<div class="composer frosted-bar">
 		<textarea
 			bind:this={textareaEl}
@@ -512,6 +559,87 @@
 	.followup-chip:hover {
 		background: var(--accent-primary);
 		color: #fff;
+	}
+
+	/* Metadata-route results table */
+	.results-table-wrap {
+		margin-top: 10px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 10px;
+		overflow-x: auto;
+	}
+	.results-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 12px;
+	}
+	.results-table th {
+		background: #f5f5f7;
+		border-bottom: 2px solid #d2d2d7;
+		padding: 6px 10px;
+		text-align: left;
+		font-weight: 600;
+		white-space: nowrap;
+	}
+	.results-table td {
+		border-bottom: 1px solid #e8e8ed;
+		padding: 6px 10px;
+		white-space: nowrap;
+	}
+	.results-table tbody tr {
+		cursor: pointer;
+		transition: background 120ms ease;
+	}
+	.results-table tbody tr:hover {
+		background: var(--bg-hover);
+	}
+	.results-table tbody tr:last-child td {
+		border-bottom: none;
+	}
+	.rt-name {
+		max-width: 220px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		font-weight: 500;
+	}
+	.rt-more {
+		padding: 6px 10px;
+		font-size: 11px;
+		color: var(--text-tertiary);
+		background: #fafafa;
+	}
+
+	/* Page-context chip */
+	.context-bar {
+		padding: 6px 14px 0;
+	}
+	.context-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		background: rgba(0, 113, 227, 0.08);
+		border: 1px solid rgba(0, 113, 227, 0.25);
+		color: var(--accent-primary);
+		border-radius: var(--radius-pill);
+		padding: 4px 10px;
+		font-size: 11.5px;
+		font-weight: 500;
+		max-width: 100%;
+	}
+	.context-clear {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		background: transparent;
+		border: none;
+		color: var(--accent-primary);
+		cursor: pointer;
+		padding: 2px;
+		border-radius: 999px;
+		line-height: 0;
+	}
+	.context-clear:hover {
+		background: rgba(0, 113, 227, 0.15);
 	}
 
 	/* Composer */

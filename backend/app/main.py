@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, D
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text, func
+from sqlalchemy import text, func, or_
 
 # OpenTelemetry Tracing Setup for Jaeger
 from opentelemetry import trace
@@ -140,8 +140,68 @@ def get_current_user(
 
 
 
+# ---------------------------------------------------------------------------
+# Cross-business access control (org / business-unit / role)
+# ---------------------------------------------------------------------------
+
+def can_read_full(user, contract) -> bool:
+    """Full contract access: owner, same business unit, or org admin."""
+    if contract.user_id == user.id:
+        return True
+    if user.business_unit_id is not None and contract.business_unit_id == user.business_unit_id:
+        return True
+    return (getattr(user, "role", None) or "member") == "org_admin"
+
+
+def get_accessible_contract(db, contract_id: str, user):
+    """Fetch a contract enforcing access rules.
+
+    404 when it doesn't exist or belongs to another organization,
+    403 when it exists in a sister business unit (discovery-only visibility).
+    """
+    from .models import BusinessUnit
+    contract = db.query(Contract).filter(Contract.id == contract_id).first()
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    if can_read_full(user, contract):
+        return contract
+    same_org = (
+        user.org_id is not None
+        and contract.business_unit_id is not None
+        and db.query(BusinessUnit)
+        .filter(BusinessUnit.id == contract.business_unit_id, BusinessUnit.org_id == user.org_id)
+        .first() is not None
+    )
+    if same_org:
+        raise HTTPException(status_code=403, detail="Cross-business-unit access is limited to discovery")
+    raise HTTPException(status_code=404, detail="Contract not found")
+
+
+def bu_scope_criterion(user):
+    """Aggregate-endpoint scope: the user's business unit's contracts plus their own."""
+    if user.business_unit_id is not None:
+        return or_(Contract.business_unit_id == user.business_unit_id,
+                   Contract.user_id == user.id)
+    return Contract.user_id == user.id
+
+
+def _resolve_business_unit(db, current_user, business_unit_id: str | None):
+    """BU for a new contract: explicit choice -> uploader's BU. Returns (id, name)."""
+    from .models import BusinessUnit
+    bu = None
+    if business_unit_id:
+        bu = (db.query(BusinessUnit)
+              .filter(BusinessUnit.id == business_unit_id,
+                      BusinessUnit.org_id == current_user.org_id)
+              .first())
+    if bu is None and current_user.business_unit_id is not None:
+        bu = db.query(BusinessUnit).filter(BusinessUnit.id == current_user.business_unit_id).first()
+    return (bu.id if bu else None), (bu.name if bu else None)
+
+
 class ContractTextIn(BaseModel):
     text: str
+    business_unit_id: str | None = None
 
 
 def log_contract_event(db: Session, contract_id: str, event_type: str, message: str, payload: dict | None = None):
@@ -216,12 +276,15 @@ async def create_contract_from_text(
             metadata["parent_contract_id"] = parent_id
             metadata["version_number"] = version_number
 
+    bu_id, bu_name = _resolve_business_unit(db, current_user, payload.business_unit_id)
     new_contract = Contract(
         filename=std_name,
         file_hash=text_hash,
         status=ContractStatus.PROCESSING,
         metadata_json=metadata,
         user_id=current_user.id,
+        business_unit_id=bu_id,
+        business_unit=bu_name,
     )
     db.add(new_contract)
     db.flush()
@@ -358,9 +421,62 @@ async def startup_event():
         ))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_template_clauses_template ON template_clauses(template_id);"))
 
-    # New feature: ensure contracts metadata can store expiry/obligations (stored in JSONB, no schema change needed)
-    # No additional columns needed - all stored in metadata_json JSONB
-    pass
+    # Promoted, queryable contract metadata columns (dual-written with metadata_json)
+    with engine.begin() as conn:
+        for ddl in [
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS company text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS counterparty text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS contract_type text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS effective_date date;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS expiry_date date;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS auto_renewal boolean;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS renewal_notice_days integer;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS total_value numeric(14,2);",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS currency varchar(3);",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS payment_terms text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS governing_law text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS business_unit text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS completeness_score real;",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_company_lower ON contracts (lower(company));",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_counterparty_lower ON contracts (lower(counterparty));",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_contract_type ON contracts (contract_type);",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_effective_date ON contracts (effective_date);",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_expiry_date ON contracts (expiry_date);",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_auto_renewal ON contracts (auto_renewal) WHERE auto_renewal IS TRUE;",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_total_value ON contracts (total_value);",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_business_unit_lower ON contracts (lower(business_unit));",
+        ]:
+            conn.execute(text(ddl))
+
+    # Organizations / business units / roles (additive to existing tables)
+    with engine.begin() as conn:
+        for ddl in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS org_id uuid REFERENCES organizations(id);",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS business_unit_id uuid REFERENCES business_units(id);",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'member';",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS business_unit_id uuid REFERENCES business_units(id);",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_business_unit_id ON contracts(business_unit_id);",
+        ]:
+            conn.execute(text(ddl))
+
+    # One-time cheap backfill: copy regex-era JSONB fields into the new columns.
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE contracts SET company = metadata_json->>'company' "
+            "WHERE company IS NULL AND metadata_json->>'company' IS NOT NULL;"
+        ))
+        conn.execute(text(
+            "UPDATE contracts SET expiry_date = (metadata_json->>'expiry_date')::date "
+            "WHERE expiry_date IS NULL AND metadata_json->>'expiry_date' ~ '^\\d{4}-\\d{2}-\\d{2}$';"
+        ))
+        conn.execute(text(
+            "UPDATE contracts SET effective_date = (metadata_json->>'contract_date')::date "
+            "WHERE effective_date IS NULL AND metadata_json->>'contract_date' ~ '^\\d{4}-\\d{2}-\\d{2}$';"
+        ))
+        conn.execute(text(
+            "UPDATE contracts SET renewal_notice_days = (metadata_json->>'renewal_notice_days')::int "
+            "WHERE renewal_notice_days IS NULL AND metadata_json->>'renewal_notice_days' ~ '^\\d+$';"
+        ))
 
     # Seed default user if not exists
     from sqlalchemy.orm import sessionmaker
@@ -376,6 +492,84 @@ async def startup_event():
             print("Default admin user admin@admin.com created.")
     except Exception as e:
         print(f"Error seeding default user: {e}")
+    finally:
+        db.close()
+
+    # Seed organization + business units + demo users (idempotent)
+    from .models import Organization, BusinessUnit
+    db = SessionLocal()
+    try:
+        org_name = os.getenv("ORG_NAME", "Jaggaer Parent").strip() or "Jaggaer Parent"
+        org = db.query(Organization).filter(Organization.name == org_name).first()
+        if not org:
+            org = Organization(name=org_name)
+            db.add(org)
+            db.flush()
+
+        bu_names = [b.strip() for b in os.getenv("DEMO_BUSINESS_UNITS", "Aerospace,Healthcare,Vernova").split(",") if b.strip()]
+        bus = {}
+        for name in bu_names:
+            bu = db.query(BusinessUnit).filter(BusinessUnit.org_id == org.id, BusinessUnit.name == name).first()
+            if not bu:
+                bu = BusinessUnit(org_id=org.id, name=name)
+                db.add(bu)
+                db.flush()
+            bus[name] = bu
+
+        first_bu = bus.get(bu_names[0]) if bu_names else None
+        admin = db.query(User).filter(User.email == "admin@admin.com").first()
+        if admin and admin.org_id is None:
+            admin.org_id = org.id
+            admin.business_unit_id = first_bu.id if first_bu else None
+            admin.role = "org_admin"
+
+        # Second demo user in another BU for on-stage scope switching
+        second_bu = bus.get(bu_names[1]) if len(bu_names) > 1 else None
+        analyst = db.query(User).filter(User.email == "analyst@healthcare.demo").first()
+        if not analyst and second_bu is not None:
+            analyst = User(
+                email="analyst@healthcare.demo",
+                hashed_password=get_password_hash("analyst"),
+                org_id=org.id,
+                business_unit_id=second_bu.id,
+                role="member",
+            )
+            db.add(analyst)
+
+        # Attach org/BU to any users still missing one (e.g. self-signups)
+        for u in db.query(User).filter(User.org_id.is_(None)).all():
+            u.org_id = org.id
+            if u.business_unit_id is None and first_bu is not None:
+                u.business_unit_id = first_bu.id
+        db.commit()
+
+        # Contract BU backfill: match text column → BU, else owner's BU
+        db.execute(text(
+            "UPDATE contracts SET business_unit_id = bu.id FROM business_units bu "
+            "WHERE contracts.business_unit_id IS NULL AND contracts.business_unit IS NOT NULL "
+            "AND lower(contracts.business_unit) = lower(bu.name);"
+        ))
+        db.execute(text(
+            "UPDATE contracts SET business_unit_id = u.business_unit_id FROM users u "
+            "WHERE contracts.business_unit_id IS NULL AND contracts.user_id = u.id "
+            "AND u.business_unit_id IS NOT NULL;"
+        ))
+        db.execute(text(
+            "UPDATE contracts SET business_unit = bu.name FROM business_units bu "
+            "WHERE contracts.business_unit_id = bu.id "
+            "AND (contracts.business_unit IS DISTINCT FROM bu.name);"
+        ))
+        # Demo staging: move the Poppulo agreement to the second BU so
+        # cross-business discovery has real content on stage.
+        if second_bu is not None:
+            db.execute(text(
+                "UPDATE contracts SET business_unit_id = :bu, business_unit = :bn "
+                "WHERE filename ILIKE '%poppulo%';"
+            ), {"bu": str(second_bu.id), "bn": second_bu.name})
+        db.commit()
+        print(f"Org seed complete: {org_name} with BUs {', '.join(bu_names)}")
+    except Exception as e:
+        print(f"Error seeding organization: {e}")
     finally:
         db.close()
 
@@ -630,6 +824,93 @@ async def _extract_and_save_obligations(contract, raw_text: str):
         existing["obligations"] = []
 
 
+def _parse_iso_date(value):
+    """Best-effort ISO date parse — swallows malformed LLM output."""
+    if not value:
+        return None
+    try:
+        from datetime import date as _date
+        return _date.fromisoformat(str(value).strip()[:10])
+    except Exception:
+        return None
+
+
+# Fields counted toward the repository completeness score (pain point:
+# "incomplete contract repository" — makes gaps visible and measurable).
+COMPLETENESS_FIELDS = [
+    "counterparty", "contract_type", "effective_date", "expiry_date",
+    "auto_renewal", "renewal_notice_days", "total_value", "currency",
+    "payment_terms", "governing_law",
+]
+
+
+async def _extract_and_save_metadata(contract, raw_text: str):
+    """LLM metadata extraction → promoted columns + dual-write into metadata_json.
+
+    Mirrors _extract_and_save_obligations: non-fatal on any failure.
+    """
+    existing = contract.metadata_json or {}
+    try:
+        from .agents import extract_contract_metadata_llm, CONTRACT_TYPES
+        m = await extract_contract_metadata_llm(raw_text)
+
+        contract.company = m.party_a or contract.company
+        contract.counterparty = m.party_b or contract.counterparty
+        if m.contract_type:
+            contract.contract_type = m.contract_type if m.contract_type in CONTRACT_TYPES else "OTHER"
+        contract.effective_date = _parse_iso_date(m.effective_date) or contract.effective_date
+        contract.expiry_date = _parse_iso_date(m.expiry_date) or contract.expiry_date
+        if m.auto_renewal is not None:
+            contract.auto_renewal = m.auto_renewal
+        if m.renewal_notice_days is not None:
+            contract.renewal_notice_days = m.renewal_notice_days
+        if m.total_value is not None:
+            contract.total_value = m.total_value
+        if m.currency:
+            contract.currency = (m.currency or "").strip()[:3].upper() or None
+        contract.payment_terms = m.payment_terms or contract.payment_terms
+        contract.governing_law = m.governing_law or contract.governing_law
+        contract.business_unit = contract.business_unit or m.business_unit_hint
+
+        present = sum(1 for f in COMPLETENESS_FIELDS if getattr(contract, f) is not None)
+        contract.completeness_score = round(present / len(COMPLETENESS_FIELDS), 2)
+
+        # Dual-write so existing JSONB readers (dashboard/calendar/vendors) keep working.
+        updates = {
+            "company": contract.company,
+            "counterparty": contract.counterparty,
+            "contract_type": contract.contract_type,
+            "contract_date": contract.effective_date.isoformat() if contract.effective_date else existing.get("contract_date"),
+            "expiry_date": contract.expiry_date.isoformat() if contract.expiry_date else existing.get("expiry_date"),
+            "auto_renewal": contract.auto_renewal,
+            "renewal_notice_days": contract.renewal_notice_days,
+            "total_value": float(contract.total_value) if contract.total_value is not None else None,
+            "currency": contract.currency,
+            "payment_terms": contract.payment_terms,
+            "governing_law": contract.governing_law,
+            "term_description": m.term_description,
+            "term_months": m.term_months,
+            "rfq_reference": m.rfq_reference,
+            "metadata_confidence": m.confidence,
+            "completeness_score": contract.completeness_score,
+        }
+        existing.update({k: v for k, v in updates.items() if v is not None})
+        if m.dynamic_attributes:
+            existing["dynamic_attributes"] = [
+                {"key": a.key, "value": a.value, "category": a.category}
+                for a in m.dynamic_attributes[:10]
+            ]
+        if m.references_other_documents:
+            existing["document_references"] = [
+                {"title": r.title, "doc_type": r.doc_type, "relationship": r.relationship,
+                 "date_mentioned": r.date_mentioned}
+                for r in m.references_other_documents[:8]
+            ]
+        contract.metadata_json = dict(existing)
+    except Exception as me:
+        print(f"Metadata extraction failed (non-fatal): {me}")
+
+
 async def analyze_contract_background(contract_id: str, raw_text: str):
     print(f"Background task started for contract: {contract_id}")
     
@@ -667,6 +948,9 @@ async def analyze_contract_background(contract_id: str, raw_text: str):
                 
                 # Run obligation extraction
                 await _extract_and_save_obligations(contract, raw_text)
+
+                # Structured + dynamic metadata extraction (promoted columns)
+                await _extract_and_save_metadata(contract, raw_text)
 
                 existing = contract.metadata_json or {}
                 contract.metadata_json = {**existing, **analysis_meta}
@@ -712,7 +996,7 @@ async def get_contract_events(
     current_user: User = Depends(get_current_user)
 ):
     # Verify contract ownership
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
         
@@ -747,7 +1031,7 @@ async def get_recent_events(
     events = (
         db.query(ContractEvent)
         .join(Contract, ContractEvent.contract_id == Contract.id)
-        .filter(Contract.user_id == current_user.id)
+        .filter(bu_scope_criterion(current_user))
         .order_by(ContractEvent.created_at.desc())
         .limit(200)
         .all()
@@ -771,6 +1055,7 @@ async def upload_contract(
     background_tasks: BackgroundTasks, 
     file: UploadFile = File(...),
     parent_id: str | None = None,
+    business_unit_id: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -832,12 +1117,15 @@ async def upload_contract(
     else:
         metadata["version_number"] = 1
         
+    bu_id, bu_name = _resolve_business_unit(db, current_user, business_unit_id)
     new_contract = Contract(
         filename=std_name,
         file_hash=file_hash,
         status=ContractStatus.PROCESSING,
         metadata_json=metadata,
-        user_id=current_user.id
+        user_id=current_user.id,
+        business_unit_id=bu_id,
+        business_unit=bu_name
     )
     db.add(new_contract)
     db.flush()
@@ -862,7 +1150,7 @@ async def reprocess_contract(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
         
@@ -894,7 +1182,7 @@ async def delete_contract(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
         
@@ -912,7 +1200,7 @@ async def contract_status(
     Story 008: lightweight polling endpoint for job status + best-effort ETA.
     (Also useful for a future CLI status command.)
     """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -1010,7 +1298,7 @@ async def get_contract_clauses(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
         
@@ -1059,23 +1347,83 @@ async def get_contract_clauses(
 
 @app.get("/api/v1/contracts")
 async def list_contracts(
+    q: str | None = None,
+    contract_type: str | None = None,
+    status: str | None = None,
+    expiry_before: str | None = None,
+    expiry_after: str | None = None,
+    auto_renewal: bool | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    business_unit: str | None = None,
+    max_completeness: float | None = None,
+    sort: str = "created_at",
+    order: str = "desc",
+    limit: int = 100,
+    offset: int = 0,
+    scope: str = "bu",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Fetch recent contracts ordered by creation date, strictly scoped to current_user
-    contracts = (
-        db.query(Contract)
-        .filter(Contract.user_id == current_user.id)
-        .order_by(Contract.created_at.desc())
-        .limit(100)
-        .all()
+    """Repository list with deterministic filters + pagination (no LLM).
+
+    scope: mine (own uploads) | bu (default: my business unit) | org
+    (whole organization — foreign-BU rows are discovery-projected).
+    """
+    from .search import SearchFilters, build_query
+
+    filters = SearchFilters(
+        text_terms=q,
+        contract_types=[contract_type] if contract_type else [],
+        status=status,
+        expiry_before=expiry_before or None,
+        expiry_after=expiry_after or None,
+        auto_renewal=auto_renewal,
+        min_value=min_value,
+        max_value=max_value,
+        business_units=[business_unit] if business_unit else [],
+        max_completeness=max_completeness,
+        sort_by=sort,
+        sort_dir=order,
+        limit=min(max(int(limit or 100), 1), 200),
     )
-    
+    from .models import BusinessUnit
+    if scope == "org" and current_user.org_id:
+        base = (db.query(Contract)
+                .join(BusinessUnit, Contract.business_unit_id == BusinessUnit.id)
+                .filter(BusinessUnit.org_id == current_user.org_id))
+    elif scope == "mine":
+        base = db.query(Contract).filter(Contract.user_id == current_user.id)
+    else:
+        base = db.query(Contract).filter(bu_scope_criterion(current_user))
+    query = build_query(base, filters)
+    total = query.count()
+    contracts = query.offset(max(int(offset or 0), 0)).limit(filters.limit).all()
+
     result = []
     for c in contracts:
+        if not can_read_full(current_user, c):
+            # Discovery-level projection: existence + key terms, no content/risk.
+            result.append({
+                "id": str(c.id),
+                "filename": c.filename,
+                "status": c.status.value,
+                "metadata_json": {},
+                "company": c.company,
+                "counterparty": c.counterparty,
+                "contract_type": c.contract_type,
+                "effective_date": c.effective_date.isoformat() if c.effective_date else None,
+                "expiry_date": c.expiry_date.isoformat() if c.expiry_date else None,
+                "business_unit": c.business_unit,
+                "discovery_only": True,
+                "overall_risk": None,
+                "created_at": c.created_at.isoformat(),
+            })
+            continue
         # Determine overall risk score from metadata
         overall_risk = "LOW"
-        risk_counts = c.metadata_json.get("risk_counts", {})
+        meta = c.metadata_json or {}
+        risk_counts = meta.get("risk_counts", {})
         if risk_counts.get("CRITICAL", 0) > 0:
             overall_risk = "CRITICAL"
         elif risk_counts.get("HIGH", 0) > 0:
@@ -1087,12 +1435,126 @@ async def list_contracts(
             "id": str(c.id),
             "filename": c.filename,
             "status": c.status.value,
-            "metadata_json": c.metadata_json,
+            # raw_text is heavy and never read by list consumers — detail endpoint serves it
+            "metadata_json": {k: v for k, v in meta.items() if k != "raw_text"},
+            "company": c.company,
+            "counterparty": c.counterparty,
+            "contract_type": c.contract_type,
+            "effective_date": c.effective_date.isoformat() if c.effective_date else None,
+            "expiry_date": c.expiry_date.isoformat() if c.expiry_date else None,
+            "auto_renewal": c.auto_renewal,
+            "total_value": float(c.total_value) if c.total_value is not None else None,
+            "currency": c.currency,
+            "business_unit": c.business_unit,
+            "completeness_score": c.completeness_score,
             "overall_risk": overall_risk if c.status == ContractStatus.COMPLETED else None,
             "created_at": c.created_at.isoformat()
         })
 
-    return {"contracts": result}
+    return {"contracts": result, "total": total}
+
+
+class SearchQueryIn(BaseModel):
+    question: str
+    limit: int | None = 25
+
+
+@app.post("/api/v1/search/query")
+async def search_query(
+    payload: SearchQueryIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Natural-language repository search — Gemini parses the question into
+    validated structured filters; deterministic ILIKE fallback on any failure."""
+    from .search import (SearchFilters, build_query, apply_risk_floor,
+                         contract_row, parse_question_to_filters, fallback_filters)
+
+    question = (payload.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    known_bus = [r[0] for r in db.query(Contract.business_unit)
+                 .filter(bu_scope_criterion(current_user), Contract.business_unit.isnot(None))
+                 .distinct().all()]
+
+    route = "metadata"
+    try:
+        filters = await parse_question_to_filters(question, known_bus)
+    except Exception as e:
+        print(f"NL search parse failed, using keyword fallback: {e}")
+        filters = fallback_filters(question)
+        route = "fallback_ilike"
+    if payload.limit:
+        filters.limit = max(1, min(int(payload.limit), 100))
+
+    base = db.query(Contract).filter(bu_scope_criterion(current_user))
+    rows = build_query(base, filters).limit(filters.limit).all()
+    rows = apply_risk_floor(rows, filters.risk_at_least)
+
+    return {
+        "route": route,
+        "filters_applied": filters.applied(),
+        "explanation": filters.describe(),
+        "results": [contract_row(c) for c in rows],
+        "total": len(rows),
+    }
+
+
+@app.get("/api/v1/saved-searches")
+async def list_saved_searches(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import SavedSearch
+    rows = (db.query(SavedSearch).filter(SavedSearch.user_id == current_user.id)
+            .order_by(SavedSearch.created_at.desc()).limit(30).all())
+    return {"saved_searches": [
+        {"id": str(s.id), "name": s.name, "question": s.question,
+         "filters": s.filters_json or {}, "created_at": s.created_at.isoformat()}
+        for s in rows
+    ]}
+
+
+class SavedSearchIn(BaseModel):
+    name: str
+    question: str | None = None
+    filters: dict = {}
+
+
+@app.post("/api/v1/saved-searches")
+async def create_saved_search(
+    payload: SavedSearchIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import SavedSearch
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    s = SavedSearch(user_id=current_user.id, name=name[:80],
+                    question=(payload.question or "").strip() or None,
+                    filters_json=payload.filters or {})
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"id": str(s.id), "name": s.name}
+
+
+@app.delete("/api/v1/saved-searches/{search_id}")
+async def delete_saved_search(
+    search_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import SavedSearch
+    s = db.query(SavedSearch).filter(SavedSearch.id == search_id,
+                                     SavedSearch.user_id == current_user.id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Saved search not found")
+    db.delete(s)
+    db.commit()
+    return {"message": "Deleted"}
 
 
 @app.get("/api/v1/risks")
@@ -1105,7 +1567,7 @@ async def list_all_risks(
     """
     contracts = (
         db.query(Contract)
-        .filter(Contract.user_id == current_user.id, Contract.status == ContractStatus.COMPLETED)
+        .filter(bu_scope_criterion(current_user), Contract.status == ContractStatus.COMPLETED)
         .all()
     )
     contract_ids = [c.id for c in contracts]
@@ -1163,7 +1625,7 @@ async def get_contract(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
         
@@ -1225,7 +1687,7 @@ async def get_contract_report(
     Structured report for CLI display (Story 011) and PDF export (Story 012).
     Returns overall risk, one-line summary, and flagged clauses (HIGH + CRITICAL).
     """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     if contract.status != ContractStatus.COMPLETED:
@@ -1301,7 +1763,7 @@ async def submit_feedback(
     Record a user correction without re-scoring. Stories 013 & 014.
     Returns a one-line confirmation and the feedback ID.
     """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -1412,10 +1874,20 @@ async def login(payload: UserLoginIn, db: Session = Depends(get_db)):
     }
 
 @app.get("/api/v1/auth/me")
-async def get_me(current_user: User = Depends(get_current_user)):
+async def get_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from .models import BusinessUnit, Organization
+    bu = db.query(BusinessUnit).filter(BusinessUnit.id == current_user.business_unit_id).first() if current_user.business_unit_id else None
+    org = db.query(Organization).filter(Organization.id == current_user.org_id).first() if current_user.org_id else None
     return {
         "id": str(current_user.id),
-        "email": current_user.email
+        "email": current_user.email,
+        "role": getattr(current_user, "role", None) or "member",
+        "business_unit": bu.name if bu else None,
+        "business_unit_id": str(bu.id) if bu else None,
+        "organization": org.name if org else None,
     }
 
 
@@ -1472,39 +1944,8 @@ class VendorEmailDraftIn(BaseModel):
     tone: str | None = "professional"
     include: str | None = "unresolved"  # unresolved | all
 
-@app.post("/api/v1/contracts/{contract_id}/chat")
-async def chat_with_contract(
-    contract_id: str,
-    payload: ChatMessageIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    RAG-powered chat: finds the most relevant clauses for the question
-    and uses them as context for GPT-4.1 to answer.
-    """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
-    if not contract:
-        raise HTTPException(status_code=404, detail="Contract not found")
-    if contract.status != ContractStatus.COMPLETED:
-        raise HTTPException(status_code=409, detail="Contract analysis must be completed before chatting.")
-
-    question = (payload.question or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="question is required")
-
-    from .chat_service import generate_chat_response
-
-    # Returns the CI-style chat contract:
-    # {answer, sources, actions, suggested_questions, route, query_scope,
-    #  conversation_mode, session_id}
-    return await generate_chat_response(
-        contract=contract,
-        question=question,
-        history=payload.history,
-        db=db,
-        session_id=payload.session_id,
-    )
+# NOTE: the per-contract chat endpoint was removed — Jaggaer Assist
+# (POST /api/v1/assistant/chat with `context`) is the single chat surface.
 
 
 # ---------------------------------------------------------------------------
@@ -1524,7 +1965,7 @@ async def get_calendar(
 
     contracts = (
         db.query(Contract)
-        .filter(Contract.user_id == current_user.id)
+        .filter(bu_scope_criterion(current_user))
         .order_by(Contract.created_at.desc())
         .all()
     )
@@ -1651,7 +2092,7 @@ async def get_vendors(
     """
     contracts = (
         db.query(Contract)
-        .filter(Contract.user_id == current_user.id)
+        .filter(bu_scope_criterion(current_user))
         .order_by(Contract.created_at.desc())
         .all()
     )
@@ -1738,7 +2179,7 @@ async def clause_repository_search(
         rows = (
             db.query(ContractClause, Contract)
             .join(Contract, Contract.id == ContractClause.contract_id)
-            .filter(Contract.user_id == current_user.id, ContractClause.embedding.isnot(None))
+            .filter(bu_scope_criterion(current_user), ContractClause.embedding.isnot(None))
             .order_by(ContractClause.embedding.cosine_distance(q_embedding))
             .limit(top_k)
             .all()
@@ -1771,10 +2212,69 @@ async def clause_repository_search(
 # Global assistant chat (bottom-left assistant)
 # ---------------------------------------------------------------------------
 
+class AssistantContextIn(BaseModel):
+    contract_id: str | None = None
+    contract_name: str | None = None
+
+
 class AssistantChatIn(BaseModel):
     question: str
-    history: list[dict] = []
+    history: list[dict] = []          # legacy fallback; server history wins when a conversation exists
     session_id: str | None = None
+    conversation_id: str | None = None
+    context: AssistantContextIn | None = None
+
+
+def _load_or_create_conversation(db, current_user, payload: AssistantChatIn, question: str):
+    """Server-side conversation record (governed chat). Returns (convo, history_messages)."""
+    from .models import AssistConversation, AssistMessage
+
+    convo = None
+    if payload.conversation_id:
+        convo = (
+            db.query(AssistConversation)
+            .filter(AssistConversation.id == payload.conversation_id,
+                    AssistConversation.user_id == current_user.id)
+            .first()
+        )
+        if not convo:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    if convo is None:
+        ctx_id = payload.context.contract_id if payload.context else None
+        convo = AssistConversation(
+            user_id=current_user.id,
+            title=(question[:44] + "…") if len(question) > 44 else question,
+            context_contract_id=ctx_id,
+        )
+        db.add(convo)
+        db.flush()
+
+    prior = (
+        db.query(AssistMessage)
+        .filter(AssistMessage.conversation_id == convo.id)
+        .order_by(AssistMessage.created_at.desc())
+        .limit(16)
+        .all()
+    )
+    history_messages = [
+        {"role": m.role, "content": m.content}
+        for m in reversed(prior)
+        if m.role in {"user", "assistant"} and m.content
+    ]
+    if not history_messages:
+        # legacy clients that still send history inline
+        for h in (payload.history or [])[-8:]:
+            if h.get("role") in {"user", "assistant"} and h.get("content"):
+                history_messages.append({"role": h["role"], "content": h["content"]})
+    return convo, history_messages
+
+
+def _persist_turn(db, convo, question: str, answer: str, meta: dict):
+    from .models import AssistMessage
+    db.add(AssistMessage(conversation_id=convo.id, role="user", content=question, meta_json={}))
+    db.add(AssistMessage(conversation_id=convo.id, role="assistant", content=answer, meta_json=meta))
+    convo.updated_at = datetime.utcnow()
+    db.commit()
 
 
 @app.post("/api/v1/assistant/chat")
@@ -1787,7 +2287,24 @@ async def assistant_chat(
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
 
-    # Retrieve cross-contract clause context for grounding
+    from .chat_service import FOLLOWUP_INSTRUCTION, extract_followups, new_session_id, EMAIL_INTENT_RE
+    from .search import (SEARCH_TOOL, SearchFilters, build_query, apply_risk_floor,
+                         contract_row)
+
+    convo, history_messages = _load_or_create_conversation(db, current_user, payload, question)
+
+    # --- Page context: contract-scoped when the user is viewing a contract ---
+    ctx_contract = None
+    if payload.context and payload.context.contract_id:
+        ctx_contract = (
+            db.query(Contract)
+            .filter(Contract.id == payload.context.contract_id)
+            .first()
+        )
+        # silently ignored when not accessible (owner / BU-mate / org admin only)
+        if ctx_contract is not None and not can_read_full(current_user, ctx_contract):
+            ctx_contract = None
+
     import openai
     client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     try:
@@ -1796,19 +2313,41 @@ async def assistant_chat(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
-    matches = (
+    # Blended retrieval: current-contract clauses first, portfolio second.
+    matches = []
+    ctx_match_count = 0
+    if ctx_contract is not None:
+        ctx_matches = (
+            db.query(ContractClause, Contract)
+            .join(Contract, Contract.id == ContractClause.contract_id)
+            .filter(Contract.id == ctx_contract.id, ContractClause.embedding.isnot(None))
+            .order_by(ContractClause.embedding.cosine_distance(q_embedding))
+            .limit(5)
+            .all()
+        )
+        ctx_match_count = len(ctx_matches)
+        matches.extend(ctx_matches)
+    portfolio_q = (
         db.query(ContractClause, Contract)
         .join(Contract, Contract.id == ContractClause.contract_id)
-        .filter(Contract.user_id == current_user.id, ContractClause.embedding.isnot(None))
-        .order_by(ContractClause.embedding.cosine_distance(q_embedding))
-        .limit(6)
+        .filter(bu_scope_criterion(current_user), ContractClause.embedding.isnot(None))
+    )
+    if ctx_contract is not None:
+        portfolio_q = portfolio_q.filter(Contract.id != ctx_contract.id)
+    matches.extend(
+        portfolio_q.order_by(ContractClause.embedding.cosine_distance(q_embedding))
+        .limit(3 if ctx_contract is not None else 6)
         .all()
     )
 
     context_parts = []
     sources = []
-    for clause, contract in matches:
+    for i, (clause, contract) in enumerate(matches):
         risk = clause.risk_level.value if clause.risk_level else "LOW"
+        if ctx_contract is not None and i == 0:
+            context_parts.append(f"=== CURRENT CONTRACT ({ctx_contract.filename}) ===")
+        if ctx_contract is not None and i == ctx_match_count and ctx_match_count > 0:
+            context_parts.append("=== OTHER CONTRACTS IN PORTFOLIO ===")
         context_parts.append(f"[{contract.filename} :: {clause.clause_type} | Risk: {risk}]\n{(clause.text_content or '')[:900]}")
         sources.append(
             {
@@ -1822,50 +2361,85 @@ async def assistant_chat(
             }
         )
 
-    from .chat_service import FOLLOWUP_INSTRUCTION, extract_followups, new_session_id, EMAIL_INTENT_RE
-
     system_prompt = (
         "You are Jaggaer Assist, the ContractsPulse copilot for procurement managers. "
         "You help answer questions and find relevant clause examples across the user's contracts. "
         "Use ONLY the provided clause excerpts. If you lack context, ask a follow-up question or say you can't confirm. "
-        "When you cite a clause, mention the contract filename."
+        "When you cite a clause, mention the contract filename. "
+        "If the user asks to FIND or FILTER contracts by attributes (type, vendor, dates, value, "
+        "renewal, business unit), call the search_contracts tool instead of answering from excerpts."
+        + (f" The user is currently viewing contract '{ctx_contract.filename}'. Prefer it when answering; "
+           "cite other contracts only for comparison." if ctx_contract is not None else "")
         + FOLLOWUP_INSTRUCTION
     )
-    history_messages = []
-    for h in (payload.history or [])[-8:]:
-        role = h.get("role", "user")
-        content = h.get("content", "")
-        if role in {"user", "assistant"} and content:
-            history_messages.append({"role": role, "content": content})
 
     separator = "\n\n---\n\n"
     joined_context = separator.join(context_parts) if context_parts else "(none)"
     user_message = f"Relevant Clauses:\n{joined_context}\n\nQuestion: {question}"
+    messages = [{"role": "system", "content": system_prompt}, *history_messages, {"role": "user", "content": user_message}]
+
     try:
         primary_model = _openai_assistant_model()
         try:
             resp = await client.chat.completions.create(
-                model=primary_model,
-                messages=[{"role": "system", "content": system_prompt}, *history_messages, {"role": "user", "content": user_message}],
-                max_tokens=4096,
-                temperature=0.2,
+                model=primary_model, messages=messages,
+                tools=[SEARCH_TOOL], tool_choice="auto",
+                max_tokens=4096, temperature=0.2,
             )
         except Exception:
             fallback_model = os.getenv("OPENAI_MODEL_ASSISTANT_FALLBACK", "gpt-4.1-mini").strip()
             resp = await client.chat.completions.create(
-                model=fallback_model,
-                messages=[{"role": "system", "content": system_prompt}, *history_messages, {"role": "user", "content": user_message}],
-                max_tokens=4096,
-                temperature=0.2,
+                model=fallback_model, messages=messages,
+                tools=[SEARCH_TOOL], tool_choice="auto",
+                max_tokens=4096, temperature=0.2,
             )
-        answer = resp.choices[0].message.content or ""
+        msg = resp.choices[0].message
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Assistant chat failed: {str(e)}")
 
-    answer, followups = extract_followups(answer)
+    # --- Metadata route: the model chose structured search over RAG ---
+    if msg.tool_calls:
+        import json as _json
+        try:
+            args = _json.loads(msg.tool_calls[0].function.arguments or "{}")
+            filters = SearchFilters(**{k: v for k, v in args.items() if k in SearchFilters.model_fields})
+        except Exception:
+            filters = SearchFilters()
+        base = db.query(Contract).filter(bu_scope_criterion(current_user))
+        rows = build_query(base, filters).limit(filters.limit).all()
+        rows = apply_risk_floor(rows, filters.risk_at_least)
+        results = [contract_row(c) for c in rows]
 
-    # In-chat quick actions: open each cited contract, copy the first redline,
-    # jump to deviations where an analysis exists, draft an email on intent.
+        n = len(results)
+        answer = (
+            f"**Found {n} contract{'s' if n != 1 else ''}** — {filters.describe()}."
+            + ("" if n else " Try loosening the filters or asking differently.")
+        )
+        actions = [
+            {"type": "open_contract", "label": f"Open {r['filename'][:30]}{'…' if len(r['filename']) > 30 else ''}", "contract_id": r["id"]}
+            for r in results[:5]
+        ]
+        response_meta = {
+            "sources": [],
+            "actions": actions,
+            "suggested_questions": [],
+            "route": "metadata",
+            "query_scope": "portfolio",
+            "filters_applied": filters.applied(),
+            "results": results,
+        }
+        _persist_turn(db, convo, question, answer, response_meta)
+        return {
+            "answer": answer,
+            "conversation_id": str(convo.id),
+            "conversation_mode": "multi_turn" if history_messages else "single_turn",
+            "session_id": new_session_id(payload.session_id),
+            **response_meta,
+        }
+
+    # --- RAG route ---
+    answer, followups = extract_followups(msg.content or "")
+
     actions: list[dict] = []
     seen_contracts: set[str] = set()
     for clause, contract in matches:
@@ -1893,19 +2467,148 @@ async def assistant_chat(
         actions.append({
             "type": "draft_email",
             "label": "Draft vendor email",
-            "contract_id": str(matches[0][1].id),
+            "contract_id": str(ctx_contract.id) if ctx_contract is not None else str(matches[0][1].id),
         })
 
-    return {
-        "answer": answer,
+    if ctx_contract is not None:
+        cited_ids = {s["contract_id"] for s in sources}
+        query_scope = "contract" if cited_ids <= {str(ctx_contract.id)} else "contract+portfolio"
+    else:
+        query_scope = "portfolio"
+
+    response_meta = {
         "sources": sources,
         "actions": actions,
         "suggested_questions": followups,
         "route": "rag",
-        "query_scope": "portfolio",
-        "conversation_mode": "multi_turn" if (payload.history or []) else "single_turn",
-        "session_id": new_session_id(payload.session_id),
+        "query_scope": query_scope,
     }
+    _persist_turn(db, convo, question, answer, response_meta)
+    return {
+        "answer": answer,
+        "conversation_id": str(convo.id),
+        "conversation_mode": "multi_turn" if history_messages else "single_turn",
+        "session_id": new_session_id(payload.session_id),
+        **response_meta,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Governed conversations — server-persisted, owner-scoped
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/conversations")
+async def list_conversations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import AssistConversation, AssistMessage
+    rows = (
+        db.query(AssistConversation)
+        .filter(AssistConversation.user_id == current_user.id)
+        .order_by(AssistConversation.updated_at.desc())
+        .limit(50)
+        .all()
+    )
+    counts = dict(
+        db.query(AssistMessage.conversation_id, func.count(AssistMessage.id))
+        .filter(AssistMessage.conversation_id.in_([r.id for r in rows]))
+        .group_by(AssistMessage.conversation_id)
+        .all()
+    ) if rows else {}
+    return {"conversations": [
+        {
+            "id": str(r.id),
+            "title": r.title,
+            "context_contract_id": str(r.context_contract_id) if r.context_contract_id else None,
+            "message_count": int(counts.get(r.id, 0)),
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in rows
+    ]}
+
+
+@app.get("/api/v1/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import AssistConversation, AssistMessage
+    convo = (
+        db.query(AssistConversation)
+        .filter(AssistConversation.id == conversation_id,
+                AssistConversation.user_id == current_user.id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    messages = (
+        db.query(AssistMessage)
+        .filter(AssistMessage.conversation_id == convo.id)
+        .order_by(AssistMessage.created_at)
+        .all()
+    )
+    return {
+        "conversation": {
+            "id": str(convo.id),
+            "title": convo.title,
+            "context_contract_id": str(convo.context_contract_id) if convo.context_contract_id else None,
+            "updated_at": convo.updated_at.isoformat() if convo.updated_at else None,
+        },
+        "messages": [
+            {"id": str(m.id), "role": m.role, "content": m.content,
+             "meta_json": m.meta_json or {}, "created_at": m.created_at.isoformat()}
+            for m in messages
+        ],
+    }
+
+
+class ConversationPatchIn(BaseModel):
+    title: str
+
+
+@app.patch("/api/v1/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: str,
+    payload: ConversationPatchIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import AssistConversation
+    convo = (
+        db.query(AssistConversation)
+        .filter(AssistConversation.id == conversation_id,
+                AssistConversation.user_id == current_user.id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    title = (payload.title or "").strip()
+    if title:
+        convo.title = title[:120]
+        db.commit()
+    return {"id": str(convo.id), "title": convo.title}
+
+
+@app.delete("/api/v1/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import AssistConversation
+    convo = (
+        db.query(AssistConversation)
+        .filter(AssistConversation.id == conversation_id,
+                AssistConversation.user_id == current_user.id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.delete(convo)
+    db.commit()
+    return {"message": "Conversation deleted"}
 
 
 # ---------------------------------------------------------------------------
@@ -2138,7 +2841,7 @@ async def analyze_contract_deviations(
 
     Runs in the background; poll GET /contracts/{id}/deviations for the result.
     """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     if contract.status != ContractStatus.COMPLETED:
@@ -2179,7 +2882,7 @@ async def get_contract_deviations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     meta = contract.metadata_json or {}
@@ -2292,7 +2995,7 @@ async def get_obligations(
     current_user: User = Depends(get_current_user)
 ):
     """Return stored obligations for a contract."""
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -2422,7 +3125,7 @@ async def generate_vendor_redlines_email(
     Generate (but do not send) an email draft to the vendor summarizing proposed redlines
     and requested changes based on redline verification results.
     """
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -2520,7 +3223,7 @@ async def list_contract_reminders(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -2554,7 +3257,7 @@ async def create_contract_reminder(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -2585,7 +3288,7 @@ async def generate_renewal_notice_letter(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -2601,7 +3304,7 @@ async def generate_obligations_on_demand(
     current_user: User = Depends(get_current_user)
 ):
     """Generate obligations on-demand for contracts that were analyzed before this feature."""
-    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.user_id == current_user.id).first()
+    contract = get_accessible_contract(db, contract_id, current_user)
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
     if contract.status != ContractStatus.COMPLETED:
@@ -2639,3 +3342,194 @@ async def generate_obligations_on_demand(
 
     background_tasks.add_task(_generate, contract_id, raw_text)
     return {"message": "Obligation generation started.", "status": "generating"}
+
+
+# ---------------------------------------------------------------------------
+# Admin: one-shot LLM metadata backfill for pre-existing contracts
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/admin/backfill-metadata")
+async def backfill_metadata(
+    force: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Run LLM metadata extraction over completed contracts that lack it.
+
+    Idempotent: skips contracts that already have a contract_type unless force=true.
+    """
+    q = db.query(Contract).filter(
+        Contract.user_id == current_user.id,
+        Contract.status == ContractStatus.COMPLETED,
+    )
+    if not force:
+        q = q.filter(Contract.contract_type.is_(None))
+    rows = q.all()
+
+    processed, failed, skipped = 0, 0, 0
+    for contract in rows:
+        raw_text = (contract.metadata_json or {}).get("raw_text") or ""
+        if not raw_text.strip():
+            skipped += 1
+            continue
+        before = contract.contract_type
+        await _extract_and_save_metadata(contract, raw_text)
+        if contract.contract_type or before:
+            processed += 1
+        else:
+            failed += 1
+        db.commit()
+
+    return {"processed": processed, "failed": failed, "skipped": skipped, "total_candidates": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# Organization: business units, cross-BU agreement discovery, chat audit
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/business-units")
+async def list_business_units(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import BusinessUnit
+    if not current_user.org_id:
+        return {"business_units": []}
+    rows = (
+        db.query(BusinessUnit)
+        .filter(BusinessUnit.org_id == current_user.org_id)
+        .order_by(BusinessUnit.name)
+        .all()
+    )
+    return {"business_units": [{"id": str(b.id), "name": b.name} for b in rows]}
+
+
+@app.get("/api/v1/org/agreements")
+async def org_agreements(
+    vendor: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cross-business discovery: which vendors does the WHOLE organization
+    already have paper with, and in which business units?
+
+    Discovery-level projection only — no clause/risk data for foreign BUs.
+    """
+    from .models import BusinessUnit
+    if not current_user.org_id:
+        return {"vendors": []}
+
+    q = (
+        db.query(Contract, BusinessUnit)
+        .join(BusinessUnit, Contract.business_unit_id == BusinessUnit.id)
+        .filter(BusinessUnit.org_id == current_user.org_id)
+    )
+    if vendor:
+        term = f"%{vendor}%"
+        q = q.filter(or_(Contract.counterparty.ilike(term), Contract.company.ilike(term),
+                         Contract.filename.ilike(term)))
+    rows = q.order_by(Contract.created_at.desc()).limit(500).all()
+
+    groups: dict = {}
+    for contract, bu in rows:
+        name = (contract.counterparty or contract.company or "Unknown vendor").strip()
+        key = name.lower()
+        g = groups.setdefault(key, {"vendor": name, "business_units": set(), "contracts": []})
+        g["business_units"].add(bu.name)
+        g["contracts"].append({
+            "id": str(contract.id),
+            "filename": contract.filename,
+            "contract_type": contract.contract_type,
+            "business_unit": bu.name,
+            "effective_date": contract.effective_date.isoformat() if contract.effective_date else None,
+            "expiry_date": contract.expiry_date.isoformat() if contract.expiry_date else None,
+            "status": contract.status.value if contract.status else None,
+            "is_mine": can_read_full(current_user, contract),
+        })
+
+    vendors = []
+    for g in groups.values():
+        vendors.append({
+            "vendor": g["vendor"],
+            "bu_count": len(g["business_units"]),
+            "business_units": sorted(g["business_units"]),
+            "contract_count": len(g["contracts"]),
+            "contracts": g["contracts"],
+        })
+    vendors.sort(key=lambda v: (-v["bu_count"], -v["contract_count"]))
+    return {"vendors": vendors}
+
+
+def _require_org_admin(current_user: User):
+    if (getattr(current_user, "role", None) or "member") != "org_admin":
+        raise HTTPException(status_code=403, detail="Requires organization admin role")
+
+
+@app.get("/api/v1/admin/conversations")
+async def admin_list_conversations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Org-admin governance: audit view over all users' Assist conversations."""
+    from .models import AssistConversation, AssistMessage, BusinessUnit
+    _require_org_admin(current_user)
+    rows = (
+        db.query(AssistConversation, User)
+        .join(User, AssistConversation.user_id == User.id)
+        .filter(User.org_id == current_user.org_id)
+        .order_by(AssistConversation.updated_at.desc())
+        .limit(200)
+        .all()
+    )
+    counts = dict(
+        db.query(AssistMessage.conversation_id, func.count(AssistMessage.id))
+        .filter(AssistMessage.conversation_id.in_([c.id for c, _ in rows]))
+        .group_by(AssistMessage.conversation_id)
+        .all()
+    ) if rows else {}
+    bu_names = {str(b.id): b.name for b in db.query(BusinessUnit).filter(BusinessUnit.org_id == current_user.org_id).all()}
+    return {"conversations": [
+        {
+            "id": str(c.id),
+            "title": c.title,
+            "owner_email": u.email,
+            "business_unit": bu_names.get(str(u.business_unit_id)) if u.business_unit_id else None,
+            "message_count": int(counts.get(c.id, 0)),
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+        for c, u in rows
+    ]}
+
+
+@app.get("/api/v1/admin/conversations/{conversation_id}")
+async def admin_get_conversation(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import AssistConversation, AssistMessage
+    _require_org_admin(current_user)
+    convo = (
+        db.query(AssistConversation, User)
+        .join(User, AssistConversation.user_id == User.id)
+        .filter(AssistConversation.id == conversation_id, User.org_id == current_user.org_id)
+        .first()
+    )
+    if not convo:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    c, u = convo
+    messages = (
+        db.query(AssistMessage)
+        .filter(AssistMessage.conversation_id == c.id)
+        .order_by(AssistMessage.created_at)
+        .all()
+    )
+    return {
+        "conversation": {"id": str(c.id), "title": c.title, "owner_email": u.email,
+                         "updated_at": c.updated_at.isoformat() if c.updated_at else None},
+        "messages": [
+            {"id": str(m.id), "role": m.role, "content": m.content,
+             "meta_json": m.meta_json or {}, "created_at": m.created_at.isoformat()}
+            for m in messages
+        ],
+    }
