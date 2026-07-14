@@ -1,6 +1,6 @@
 export class AuthState {
 	token = $state<string | null>(null);
-	user = $state<{ id: string; email: string } | null>(null);
+	user = $state<{ id: string; email: string; role?: string } | null>(null);
 	// Safe default: hide signup until the API confirms it's enabled.
 	signupDisabled = $state<boolean>(true);
 	initialized = $state<boolean>(false);
@@ -36,7 +36,7 @@ export class AuthState {
 		}
 	}
 
-	setUser(user: { id: string; email: string } | null) {
+	setUser(user: { id: string; email: string; role?: string } | null) {
 		this.user = user;
 		if (typeof window !== 'undefined') {
 			if (user) {

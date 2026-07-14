@@ -5,6 +5,7 @@
 	import { apiFetch } from '$lib/api';
 	import { toast } from '$lib/toastStore';
 	import { assist } from '$lib/assist.svelte';
+	import { authState } from '$lib/auth.svelte';
 
 	type ContractDetail = {
 		id: string;
@@ -50,8 +51,8 @@
 	let isCopied = $state(false);
 
 	// Tabs state
-	let activeTab = $state('overview'); // 'overview' | 'risks' | 'clauses' | 'obligations' | 'verification' | 'deviation' | 'trace'
-	const VALID_TABS = ['overview', 'risks', 'clauses', 'obligations', 'verification', 'deviation', 'trace'];
+	let activeTab = $state('overview'); // 'overview' | 'risks' | 'clauses' | 'obligations' | 'verification' | 'deviation' | 'workflow' | 'history' | 'trace'
+	const VALID_TABS = ['overview', 'risks', 'clauses', 'obligations', 'verification', 'deviation', 'workflow', 'history', 'trace'];
 
 	// Obligations state
 	type ObligationItem = {
@@ -77,6 +78,7 @@
 	let allContracts = $state<ContractDetail[]>([]);
 	let versionDropdownOpen = $state(false);
 	let uploadRevisionModalOpen = $state(false);
+	let revisionParty = $state<'internal' | 'counterparty'>('internal');
 	let revisionInputType = $state<'file' | 'text'>('file');
 	let revisionText = $state('');
 	let isRevisionUploading = $state(false);
@@ -558,7 +560,7 @@
 
 		const loadingToastId = toast.loading(`Uploading revision ${revisionFile.name}...`);
 		try {
-			const response = await apiFetch(`/api/v1/contracts/upload?parent_id=${contractId}`, {
+			const response = await apiFetch(`/api/v1/contracts/upload?parent_id=${contractId}&party=${revisionParty}`, {
 				method: 'POST',
 				body: formData
 			});
@@ -585,7 +587,7 @@
 		isRevisionUploading = true;
 		const loadingToastId = toast.loading('Submitting revision text for analysis...');
 		try {
-			const response = await apiFetch(`/api/v1/contracts/text?parent_id=${contractId}`, {
+			const response = await apiFetch(`/api/v1/contracts/text?parent_id=${contractId}&party=${revisionParty}`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ text })
@@ -729,6 +731,121 @@
 			loadVersionChain();
 		}
 	});
+
+	// --- Workflow / lifecycle cockpit ---
+	const LIFECYCLE_ORDER = ['DRAFT', 'INTERNAL_REVIEW', 'SENT_TO_SUPPLIER', 'NEGOTIATION', 'LEGAL_APPROVAL', 'SIGNATURE', 'EXECUTED', 'ACTIVE', 'EXPIRED', 'TERMINATED'];
+	const WF_MAIN_PATH = ['DRAFT', 'INTERNAL_REVIEW', 'SENT_TO_SUPPLIER', 'NEGOTIATION', 'LEGAL_APPROVAL', 'SIGNATURE', 'EXECUTED', 'ACTIVE'];
+	let workflowData = $state<any>(null);
+	let approvalsData = $state<any[]>([]);
+	let lineageData = $state<any>(null);
+	let workflowLoading = $state(false);
+	let transitionNote = $state('');
+
+	const wfCurrentIdx = $derived(workflowData ? LIFECYCLE_ORDER.indexOf(workflowData.current_stage) : -1);
+	const wfPending = $derived((approvalsData || []).filter((a: any) => a.status === 'PENDING'));
+	const wfGateRole = $derived.by(() => {
+		const gated = (workflowData?.allowed_transitions || []).find((t: any) => t.gated && t.gate_role);
+		if (gated) return gated.gate_role;
+		return wfPending[0]?.assigned_role || 'approver';
+	});
+
+	function wfStageLabel(stage: string) {
+		const s = (workflowData?.stages || []).find((x: any) => x.stage === stage);
+		if (s?.label) return s.label;
+		return (stage || '').split('_').map((w: string) => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
+	}
+	function wfStageOwner(stage: string) {
+		const s = (workflowData?.stages || []).find((x: any) => x.stage === stage);
+		if (s?.owner) return s.owner;
+		if (stage === 'SENT_TO_SUPPLIER') return 'counterparty';
+		if (stage === 'LEGAL_APPROVAL') return 'legal';
+		return '';
+	}
+	function wfPhaseBadge(stage: string) {
+		switch (stage) {
+			case 'DRAFT':
+			case 'INTERNAL_REVIEW': return 'badge-blue';
+			case 'SENT_TO_SUPPLIER':
+			case 'NEGOTIATION': return 'badge-purple';
+			case 'LEGAL_APPROVAL': return 'badge-warning';
+			case 'SIGNATURE': return 'badge-blue';
+			case 'EXECUTED':
+			case 'ACTIVE': return 'badge-success';
+			case 'TERMINATED': return 'badge-danger';
+			default: return 'badge-secondary';
+		}
+	}
+	function hasApproval(stage: string) {
+		return (approvalsData || []).some((a: any) => a.target_stage === stage && a.status === 'APPROVED');
+	}
+
+	async function loadWorkflow() {
+		if (!contractId) return;
+		workflowLoading = true;
+		try {
+			const [wfRes, apRes, lnRes] = await Promise.all([
+				apiFetch(`/api/v1/contracts/${contractId}/workflow`),
+				apiFetch(`/api/v1/contracts/${contractId}/approvals`),
+				apiFetch(`/api/v1/contracts/${contractId}/lineage`)
+			]);
+			if (wfRes.ok) workflowData = await wfRes.json();
+			if (apRes.ok) { const d = await apRes.json(); approvalsData = d.approvals || []; }
+			if (lnRes.ok) lineageData = await lnRes.json();
+		} catch {
+			toast.error('Failed to load workflow');
+		} finally {
+			workflowLoading = false;
+		}
+	}
+
+	async function doTransition(toStage: string, note = '') {
+		try {
+			const res = await apiFetch(`/api/v1/contracts/${contractId}/transition`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ to_stage: toStage, note: note || undefined })
+			});
+			const j = await res.json().catch(() => ({}));
+			if (!res.ok) { toast.error(j?.detail || 'Transition blocked'); return; }
+			transitionNote = '';
+			await loadWorkflow();
+			toast.success(`Moved to ${wfStageLabel(toStage)}`);
+		} catch {
+			toast.error('Transition failed');
+		}
+	}
+
+	async function requestApproval(targetStage: string) {
+		try {
+			const res = await apiFetch('/api/v1/approvals', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ contract_id: contractId, artifact_type: 'stage_advance', target_stage: targetStage })
+			});
+			const j = await res.json().catch(() => ({}));
+			if (!res.ok) { toast.error(j?.detail || 'Failed to request approval'); return; }
+			await loadWorkflow();
+			toast.success('Approval requested');
+		} catch {
+			toast.error('Failed to request approval');
+		}
+	}
+
+	async function decideApproval(id: string, decision: 'APPROVED' | 'REJECTED' | 'CHANGES_REQUESTED') {
+		try {
+			const res = await apiFetch(`/api/v1/approvals/${id}/decide`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ decision })
+			});
+			const j = await res.json().catch(() => ({}));
+			if (!res.ok) { toast.error(j?.detail || 'Failed to record decision'); return; }
+			await loadWorkflow();
+			toast.success(`Approval ${decision.toLowerCase().replace('_', ' ')}`);
+		} catch {
+			toast.error('Failed to record decision');
+		}
+	}
 
 	// --- Template deviation (first-party paper) ---
 	let availableTemplates = $state<any[]>([]);
@@ -911,6 +1028,12 @@
 		}
 	});
 
+	$effect(() => {
+		if ((activeTab === 'workflow' || activeTab === 'history') && contract?.status === 'COMPLETED' && !workflowData && !workflowLoading) {
+			loadWorkflow();
+		}
+	});
+
 	// Reactively start/stop the stopwatch based on processing status
 	$effect(() => {
 		if (contract?.status === 'PROCESSING') {
@@ -968,6 +1091,12 @@
 					</div>
 				{/if}
 			</div>
+			{#if workflowData?.current_stage}
+				<span class="separator">›</span>
+				<button type="button" class="wf-strip" onclick={() => activeTab = 'workflow'} title="Open workflow cockpit">
+					<span class="badge {wfPhaseBadge(workflowData.current_stage)} badge-sm">Workflow: {wfStageLabel(workflowData.current_stage)}</span>
+				</button>
+			{/if}
 		</div>
 		<div class="cockpit-actions">
 			{#if contract.status === 'COMPLETED'}
@@ -1082,6 +1211,17 @@
 						{#if deviationData?.summary?.off_playbook}
 							<span class="badge badge-danger badge-sm" style="margin-left: 4px;">{deviationData.summary.off_playbook}</span>
 						{/if}
+					</button>
+					<button role="tab" aria-selected={activeTab === 'workflow'} class="tab-btn" class:active={activeTab === 'workflow'} onclick={() => activeTab = 'workflow'}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/><circle cx="7" cy="14" r="1"/><circle cx="11" cy="10" r="1"/><circle cx="14" cy="13" r="1"/></svg>
+						Workflow
+						{#if workflowData?.gate_blocked || wfPending.length > 0}
+							<span class="badge badge-warning badge-sm" style="margin-left: 4px;">!</span>
+						{/if}
+					</button>
+					<button role="tab" aria-selected={activeTab === 'history'} class="tab-btn" class:active={activeTab === 'history'} onclick={() => activeTab = 'history'}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>
+						History
 					</button>
 				{/if}
 				{#if contract.status === 'PROCESSING'}
@@ -1883,6 +2023,180 @@
 						{/if}
 					</div>
 				{/if}
+
+				<!-- WORKFLOW TAB (lifecycle cockpit) -->
+				{#if activeTab === 'workflow' && contract.status === 'COMPLETED'}
+					<div class="tab-content flex-col gap-24">
+						{#if workflowLoading && !workflowData}
+							<div class="wf-loading"><span class="spinner spinner-md"></span><p class="text-tertiary">Loading workflow…</p></div>
+						{:else if !workflowData}
+							<div class="empty-state bg-panel-glow">
+								<p class="text-secondary">Workflow could not be loaded for this contract.</p>
+							</div>
+						{:else}
+							<!-- Flow diagram stepper -->
+							<div class="wf-flow-card bg-panel-glow">
+								<div class="wf-stepper">
+									{#each WF_MAIN_PATH as stage, i}
+										{@const idx = LIFECYCLE_ORDER.indexOf(stage)}
+										{@const nodeState = idx < wfCurrentIdx ? 'done' : idx === wfCurrentIdx ? 'current' : 'upcoming'}
+										{#if i > 0}
+											<div class="wf-connector {idx <= wfCurrentIdx ? 'wf-conn-done' : 'wf-conn-todo'}"></div>
+										{/if}
+										<div class="wf-node wf-{nodeState}">
+											<div class="wf-circle">
+												{#if nodeState === 'done'}
+													<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+												{:else}
+													{i + 1}
+												{/if}
+											</div>
+											<div class="wf-node-label">{wfStageLabel(stage)}</div>
+											{#if wfStageOwner(stage)}
+												<div class="wf-node-owner">{wfStageOwner(stage)}</div>
+											{/if}
+										</div>
+									{/each}
+								</div>
+								{#if workflowData.current_stage === 'EXPIRED' || workflowData.current_stage === 'TERMINATED'}
+									<div class="wf-terminal">
+										<span class="badge {wfPhaseBadge(workflowData.current_stage)}">Terminal state: {wfStageLabel(workflowData.current_stage)}</span>
+									</div>
+								{/if}
+							</div>
+
+							<!-- Current stage banner -->
+							<div class="wf-banner card">
+								<div class="wf-banner-main">
+									<span class="wf-banner-label">{wfStageLabel(workflowData.current_stage)}</span>
+									<span class="wf-banner-sub text-tertiary">{workflowData.party} · Round {workflowData.round}</span>
+								</div>
+								{#if workflowData.gate_blocked || wfPending.length > 0}
+									<span class="badge badge-warning">Awaiting {wfGateRole} approval</span>
+								{/if}
+							</div>
+
+							<!-- Actions -->
+							<div class="wf-actions">
+								<h4 class="wf-subtitle">Advance workflow</h4>
+								<input class="wf-note-input" type="text" placeholder="Add a note (optional)…" bind:value={transitionNote} />
+								<div class="wf-action-btns">
+									{#each workflowData.allowed_transitions || [] as t}
+										{#if t.gated && !hasApproval(t.to_stage)}
+											<button type="button" class="btn btn-secondary btn-compact" disabled={!t.can_drive} onclick={() => requestApproval(t.to_stage)}>
+												Request {t.gate_role} approval
+											</button>
+										{:else}
+											<button type="button" class="btn btn-primary btn-compact" disabled={!t.can_drive} onclick={() => doTransition(t.to_stage, transitionNote)}>
+												Move to {t.label}
+											</button>
+										{/if}
+									{/each}
+									{#if !(workflowData.allowed_transitions || []).length}
+										<span class="text-tertiary font-size-12">No further transitions available from this stage.</span>
+									{/if}
+								</div>
+							</div>
+
+							<!-- Pending approval cards -->
+							{#if wfPending.length > 0}
+								<div class="wf-approvals flex-col gap-16">
+									<h4 class="wf-subtitle">Pending approvals</h4>
+									{#each wfPending as ap (ap.id)}
+										{@const canDecide = authState.user?.role === ap.assigned_role || authState.user?.role === 'org_admin'}
+										<div class="resolution-card bg-panel-glow">
+											<div class="rc-header">
+												<div class="rc-header-left">
+													<span class="clause-type-tag">{ap.artifact_type}</span>
+													<span class="badge badge-purple badge-sm">{ap.assigned_role}</span>
+													{#if ap.target_stage}
+														<span class="badge badge-secondary badge-sm">→ {wfStageLabel(ap.target_stage)}</span>
+													{/if}
+												</div>
+												<span class="badge badge-warning badge-sm">Pending</span>
+											</div>
+											{#if ap.artifact_type === 'vendor_email' && ap.artifact_ref}
+												<div class="wf-email-block">
+													{#if ap.artifact_ref.subject}<div class="wf-email-subject">{ap.artifact_ref.subject}</div>{/if}
+													{#if ap.artifact_ref.body}<pre class="wf-email-body">{ap.artifact_ref.body}</pre>{/if}
+												</div>
+											{/if}
+											{#if canDecide}
+												<div class="wf-approval-actions">
+													<button type="button" class="btn btn-primary btn-compact" onclick={() => decideApproval(ap.id, 'APPROVED')}>Approve</button>
+													<button type="button" class="btn btn-secondary btn-compact" onclick={() => decideApproval(ap.id, 'CHANGES_REQUESTED')}>Request changes</button>
+													<button type="button" class="btn btn-secondary btn-compact" onclick={() => decideApproval(ap.id, 'REJECTED')}>Reject</button>
+												</div>
+											{:else}
+												<p class="wf-await-note text-tertiary">Awaiting {ap.assigned_role} approval</p>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
+
+							<!-- Transition history trace -->
+							<div class="wf-trace-section">
+								<h4 class="wf-subtitle">Transition history</h4>
+								{#if (workflowData.transitions || []).length > 0}
+									<ul class="wf-trace">
+										{#each workflowData.transitions as tr}
+											<li class="wf-trace-item">
+												<span class="wf-trace-edge">{wfStageLabel(tr.from_stage)} → {wfStageLabel(tr.to_stage)}</span>
+												<span class="wf-trace-meta text-tertiary">{tr.actor} · {timeAgo(tr.created_at)}</span>
+											</li>
+										{/each}
+									</ul>
+								{:else}
+									<p class="text-tertiary font-size-12">No transitions recorded yet.</p>
+								{/if}
+							</div>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- HISTORY TAB (version round-trip timeline) -->
+				{#if activeTab === 'history' && contract.status === 'COMPLETED'}
+					<div class="tab-content flex-col gap-16">
+						<h3 class="subsection-title">Version Round-Trip</h3>
+						{#if workflowLoading && !lineageData}
+							<div class="wf-loading"><span class="spinner spinner-md"></span><p class="text-tertiary">Loading revision history…</p></div>
+						{:else if !lineageData || (lineageData.versions || []).length <= 1}
+							<div class="empty-state bg-panel-glow">
+								<p class="text-secondary">No revisions yet — this is the original draft.</p>
+							</div>
+						{:else}
+							<div class="hist-timeline">
+								{#each lineageData.versions as v (v.id)}
+									{@const isCp = v.party === 'counterparty'}
+									<div class="hist-step" class:hist-current={v.is_current}>
+										<div class="hist-icon {isCp ? 'hist-cp' : 'hist-internal'}"></div>
+										<div class="hist-content">
+											<div class="hist-row-top">
+												<span class="badge {isCp ? 'badge-purple' : 'badge-blue'} badge-sm">{isCp ? 'Counterparty' : 'Our draft'}</span>
+												<span class="hist-ver">v{v.version_number} · Round {v.round}</span>
+												{#if v.is_current}<span class="badge badge-success badge-sm">Current</span>{/if}
+												<span class="hist-time text-tertiary">{timeAgo(v.created_at)}</span>
+											</div>
+											<div class="hist-meta text-tertiary">
+												{wfStageLabel(v.lifecycle_stage)}
+												{#if v.changed_clauses > 0}
+													· {v.changed_clauses} clauses changed / {v.resolved_clauses} resolved
+												{/if}
+											</div>
+											<div class="hist-links">
+												<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id)}>Open</button>
+												{#if v.changed_clauses > 0}
+													<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id + '?tab=verification')}>View redlines</button>
+												{/if}
+											</div>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/if}
 			</div>
 		</div>
 	</div>
@@ -2057,6 +2371,20 @@
 				<h3>Upload Revised Version</h3>
 			</div>
 			<div class="modal-body">
+				<div class="rev-party">
+					<div class="rev-party-label">Who produced this version?</div>
+					<div class="rev-party-opts">
+						<button type="button" class="rev-party-opt" class:active={revisionParty === 'internal'} onclick={() => (revisionParty = 'internal')}>
+							<span class="badge badge-blue badge-sm">Our revision</span>
+							<span class="rev-party-hint">We edited this draft</span>
+						</button>
+						<button type="button" class="rev-party-opt" class:active={revisionParty === 'counterparty'} onclick={() => (revisionParty = 'counterparty')}>
+							<span class="badge badge-purple badge-sm">Counterparty</span>
+							<span class="rev-party-hint">Supplier's returned redlines</span>
+						</button>
+					</div>
+				</div>
+
 				<div class="tabs-nav-modal" role="tablist" aria-label="Upload Method">
 					<button class="tab-nav-modal-btn" role="tab" aria-selected={revisionInputType === 'file'} class:active={revisionInputType === 'file'} onclick={() => { revisionInputType = 'file'; revisionFile = null; }}>
 						Upload Document
@@ -4237,4 +4565,309 @@
 		color: var(--text-primary);
 		overflow-wrap: anywhere;
 	}
+
+	/* --- Workflow cockpit --- */
+	.wf-strip {
+		background: none;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+	}
+	.wf-loading {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 10px;
+		padding: 40px 0;
+	}
+	.wf-flow-card {
+		border: 1px solid var(--border-subtle);
+		border-radius: 12px;
+		padding: 22px 18px;
+	}
+	.wf-stepper {
+		display: flex;
+		align-items: flex-start;
+		gap: 0;
+		overflow-x: auto;
+		padding-bottom: 6px;
+	}
+	.wf-node {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 6px;
+		width: 90px;
+		flex-shrink: 0;
+		text-align: center;
+	}
+	.wf-circle {
+		width: 30px;
+		height: 30px;
+		border-radius: 50%;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 12px;
+		font-weight: 700;
+		border: 2px solid var(--border-subtle);
+		background: var(--bg-panel);
+		color: var(--text-tertiary);
+		flex-shrink: 0;
+	}
+	.wf-done .wf-circle {
+		background: var(--accent-primary);
+		border-color: var(--accent-primary);
+		color: #fff;
+	}
+	.wf-current .wf-circle {
+		border-color: var(--accent-primary);
+		color: var(--accent-primary);
+		box-shadow: var(--ring);
+	}
+	.wf-node-label {
+		font-size: 11px;
+		font-weight: 600;
+		color: var(--text-secondary);
+		line-height: 1.25;
+	}
+	.wf-current .wf-node-label { color: var(--text-primary); }
+	.wf-upcoming .wf-node-label { color: var(--text-tertiary); }
+	.wf-node-owner {
+		font-size: 9px;
+		text-transform: uppercase;
+		letter-spacing: 0.4px;
+		color: var(--text-tertiary);
+	}
+	.wf-connector {
+		flex: 1;
+		min-width: 20px;
+		height: 2px;
+		margin-top: 14px;
+		background: var(--border-subtle);
+	}
+	.wf-conn-done { background: var(--accent-primary); }
+	.wf-terminal {
+		margin-top: 14px;
+		display: flex;
+		justify-content: center;
+	}
+	.wf-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 16px 18px;
+	}
+	.wf-banner-main {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.wf-banner-label {
+		font-size: 18px;
+		font-weight: 700;
+		color: var(--text-primary);
+	}
+	.wf-banner-sub { font-size: 12px; }
+	.wf-subtitle {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin: 0 0 10px 0;
+	}
+	.wf-actions {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+	.wf-note-input {
+		width: 100%;
+		padding: 8px 12px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 8px;
+		background: var(--bg-panel);
+		color: var(--text-primary);
+		font-size: 13px;
+	}
+	.wf-note-input:focus {
+		outline: none;
+		border-color: var(--accent-primary);
+		box-shadow: var(--ring);
+	}
+	.wf-action-btns {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+	.wf-email-block {
+		margin-top: 10px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 8px;
+		padding: 10px 12px;
+		background: var(--bg-hover);
+	}
+	.wf-email-subject {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-primary);
+		margin-bottom: 6px;
+	}
+	.wf-email-body {
+		font-family: ui-monospace, monospace;
+		font-size: 11px;
+		color: var(--text-secondary);
+		white-space: pre-wrap;
+		word-break: break-word;
+		margin: 0;
+	}
+	.wf-approval-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.wf-await-note {
+		font-size: 12px;
+		margin: 10px 0 0 0;
+	}
+	.wf-trace {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.wf-trace-item {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 10px;
+		font-size: 12px;
+		padding: 8px 12px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 8px;
+		background: var(--bg-panel);
+	}
+	.wf-trace-edge {
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+	.wf-trace-meta { font-size: 11px; }
+
+	/* --- Version round-trip history --- */
+	.hist-timeline {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.hist-step {
+		display: flex;
+		gap: 14px;
+		position: relative;
+		padding-bottom: 18px;
+	}
+	.hist-step::before {
+		content: '';
+		position: absolute;
+		left: 6px;
+		top: 16px;
+		bottom: -2px;
+		width: 1px;
+		background: var(--border-subtle);
+	}
+	.hist-step:last-child::before { display: none; }
+	.hist-icon {
+		width: 13px;
+		height: 13px;
+		border-radius: 50%;
+		flex-shrink: 0;
+		margin-top: 3px;
+		z-index: 1;
+		border: 2px solid var(--bg-panel);
+	}
+	.hist-internal {
+		background: var(--accent-primary);
+		box-shadow: 0 0 0 1px var(--accent-primary);
+	}
+	.hist-cp {
+		background: #af52de;
+		box-shadow: 0 0 0 1px #af52de;
+	}
+	.hist-current .hist-icon { box-shadow: 0 0 0 3px rgba(var(--accent-primary-rgb), 0.2); }
+	.hist-content {
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
+		flex: 1;
+		min-width: 0;
+	}
+	.hist-row-top {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+	.hist-ver {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+	.hist-time { font-size: 11px; margin-left: auto; }
+	.hist-meta { font-size: 12px; }
+	.hist-links {
+		display: flex;
+		gap: 14px;
+		margin-top: 2px;
+	}
+	.hist-link {
+		background: none;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		font-size: 12px;
+		font-weight: 500;
+		color: var(--accent-primary);
+	}
+	.hist-link:hover { text-decoration: underline; }
+
+	.rev-party {
+		margin-bottom: 16px;
+	}
+	.rev-party-label {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--text-secondary);
+		margin-bottom: 8px;
+	}
+	.rev-party-opts {
+		display: flex;
+		gap: 10px;
+	}
+	.rev-party-opt {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 4px;
+		padding: 10px 12px;
+		border: 1.5px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+		background: var(--bg-hover);
+		cursor: pointer;
+		transition: border-color 150ms ease, background 150ms ease;
+	}
+	.rev-party-opt.active {
+		border-color: var(--accent-primary);
+		background: #fff;
+		box-shadow: var(--ring);
+	}
+	.rev-party-hint {
+		font-size: 11px;
+		color: var(--text-tertiary);
+	}
+
 </style>

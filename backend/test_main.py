@@ -50,7 +50,13 @@ def test_extract_auto_renewal_info_case_insensitivity():
 def test_root_endpoint():
     response = client.get("/")
     assert response.status_code == 200
-    assert response.json() == {"message": "ContractsPulse API is running"}
+    # In single-origin mode the built SPA is served at "/"; without a build the
+    # API returns its JSON banner. Accept either.
+    ctype = response.headers.get("content-type", "")
+    if "application/json" in ctype:
+        assert response.json() == {"message": "ContractsPulse API is running"}
+    else:
+        assert "<!doctype html>" in response.text.lower() or "<html" in response.text.lower()
 
 def test_health_check_endpoint():
     response = client.get("/health")

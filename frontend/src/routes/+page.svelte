@@ -14,6 +14,7 @@
 		metadata_json?: any;
 		overall_risk?: string | null;
 		created_at: string;
+		lifecycle_stage?: string | null;
 	};
 
 	
@@ -61,6 +62,7 @@
 			idleMs: 30000
 		});
 		poller.start();
+		loadApprovals();
 	});
 
 	onDestroy(() => {
@@ -206,7 +208,7 @@
 		const now = new Date();
 		const date = new Date(dateString);
 		const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
-		
+
 		if (seconds < 60) return 'Just now';
 		const minutes = Math.floor(seconds / 60);
 		if (minutes < 60) return `${minutes}m ago`;
@@ -214,6 +216,49 @@
 		if (hours < 24) return `${hours}h ago`;
 		const days = Math.floor(hours / 24);
 		return `${days}d ago`;
+	}
+
+	// --- Lifecycle stage + pending approvals widgets ---
+	const DASH_STAGE_ORDER = ['DRAFT', 'INTERNAL_REVIEW', 'SENT_TO_SUPPLIER', 'NEGOTIATION', 'LEGAL_APPROVAL', 'SIGNATURE', 'EXECUTED', 'ACTIVE', 'EXPIRED', 'TERMINATED'];
+
+	function dashStageLabel(stage: string | null | undefined) {
+		return (stage || 'DRAFT').split('_').map((w) => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
+	}
+	function dashStageColor(stage: string | null | undefined) {
+		switch (stage) {
+			case 'DRAFT':
+			case 'INTERNAL_REVIEW': return 'var(--accent-primary)';
+			case 'SENT_TO_SUPPLIER':
+			case 'NEGOTIATION': return '#af52de';
+			case 'LEGAL_APPROVAL': return 'var(--color-high)';
+			case 'SIGNATURE': return 'var(--accent-primary)';
+			case 'EXECUTED':
+			case 'ACTIVE': return 'var(--color-low)';
+			case 'TERMINATED': return 'var(--color-critical)';
+			default: return 'var(--text-tertiary)';
+		}
+	}
+
+	let lifecycleCounts = $derived.by(() => {
+		const counts: Record<string, number> = {};
+		contracts.forEach((c) => {
+			const stage = c.lifecycle_stage || 'DRAFT';
+			counts[stage] = (counts[stage] || 0) + 1;
+		});
+		return DASH_STAGE_ORDER.filter((s) => counts[s] > 0).map((s) => ({ stage: s, count: counts[s] }));
+	});
+
+	let pendingApprovals = $state<any[]>([]);
+	async function loadApprovals() {
+		try {
+			const res = await apiFetch('/api/v1/approvals');
+			if (res.ok) {
+				const d = await res.json();
+				pendingApprovals = d.approvals || [];
+			}
+		} catch {
+			/* non-fatal */
+		}
 	}
 </script>
 
@@ -402,6 +447,56 @@
 			<p class="pr-empty">Not generated yet.</p>
 		{/if}
 	</div>
+
+	<!-- Contracts by Lifecycle Stage -->
+	{#if lifecycleCounts.length > 0}
+		<div class="dash-wf-lifecycle panel" id="dash-lifecycle-stages">
+			<div class="dash-wf-header">
+				<div>
+					<h3>Contracts by Lifecycle Stage</h3>
+					<p class="text-tertiary">Where your agreements sit in the negotiation-to-active workflow</p>
+				</div>
+			</div>
+			<div class="dash-wf-stage-row">
+				{#each lifecycleCounts as s (s.stage)}
+					<button type="button" class="dash-wf-stage-chip" style="--chip: {dashStageColor(s.stage)}" onclick={() => goto('/contracts?stage=' + s.stage)}>
+						<span class="dash-wf-stage-dot"></span>
+						<span class="dash-wf-stage-name">{dashStageLabel(s.stage)}</span>
+						<span class="dash-wf-stage-count">{s.count}</span>
+					</button>
+				{/each}
+			</div>
+		</div>
+	{/if}
+
+	<!-- Pending Approvals -->
+	{#if pendingApprovals.length > 0}
+		<div class="dash-wf-approvals panel" id="dash-pending-approvals">
+			<div class="dash-wf-header">
+				<div>
+					<h3>Pending Approvals <span class="badge badge-warning badge-sm">{pendingApprovals.length}</span></h3>
+					<p class="text-tertiary">Items awaiting a decision in your approval queue</p>
+				</div>
+			</div>
+			<div class="dash-wf-approval-list">
+				{#each pendingApprovals as ap (ap.id)}
+					<div class="dash-wf-approval-item">
+						<div class="dash-wf-approval-main">
+							<svg class="file-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+							<div class="dash-wf-approval-text">
+								<span class="dash-wf-approval-name">{ap.contract_filename || 'Contract'}</span>
+								<span class="dash-wf-approval-sub text-tertiary">{ap.artifact_type} · {dashStageLabel(ap.lifecycle_stage)}</span>
+							</div>
+						</div>
+						<div class="dash-wf-approval-right">
+							<span class="badge badge-purple badge-sm">{ap.assigned_role}</span>
+							<button type="button" class="btn btn-secondary btn-compact" onclick={() => goto('/contracts/' + ap.contract_id + '?tab=workflow')}>Review</button>
+						</div>
+					</div>
+				{/each}
+			</div>
+		</div>
+	{/if}
 
 	<!-- Obligation Risk Heatmap Component -->
 	<div class="heatmap-section panel" id="kpi-obligation-heatmap">
@@ -1209,5 +1304,109 @@
 		margin: 0;
 		font-size: 13px;
 		color: var(--text-tertiary);
+	}
+
+	/* --- Lifecycle stage + pending approvals widgets --- */
+	.dash-wf-lifecycle,
+	.dash-wf-approvals {
+		padding: 22px 24px;
+		margin-bottom: 24px;
+	}
+	.dash-wf-header {
+		margin-bottom: 16px;
+	}
+	.dash-wf-header h3 {
+		margin: 0;
+		font-size: 15px;
+		font-weight: 600;
+		color: var(--text-primary);
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.dash-wf-header p {
+		margin: 4px 0 0 0;
+		font-size: 12px;
+	}
+	.dash-wf-stage-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 10px;
+	}
+	.dash-wf-stage-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 7px 14px;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-pill);
+		background: var(--bg-panel);
+		cursor: pointer;
+		font-size: 12px;
+		color: var(--text-secondary);
+		transition: background 0.15s ease, border-color 0.15s ease;
+	}
+	.dash-wf-stage-chip:hover {
+		background: var(--bg-hover);
+		border-color: var(--chip);
+	}
+	.dash-wf-stage-dot {
+		width: 9px;
+		height: 9px;
+		border-radius: 50%;
+		background: var(--chip);
+		flex-shrink: 0;
+	}
+	.dash-wf-stage-name {
+		font-weight: 500;
+		color: var(--text-primary);
+	}
+	.dash-wf-stage-count {
+		font-weight: 700;
+		color: var(--chip);
+	}
+	.dash-wf-approval-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.dash-wf-approval-item {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 10px 14px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 10px;
+		background: var(--bg-panel);
+	}
+	.dash-wf-approval-main {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		min-width: 0;
+	}
+	.dash-wf-approval-text {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+	.dash-wf-approval-name {
+		font-size: 13px;
+		font-weight: 600;
+		color: var(--text-primary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.dash-wf-approval-sub {
+		font-size: 11px;
+	}
+	.dash-wf-approval-right {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		flex-shrink: 0;
 	}
 </style>

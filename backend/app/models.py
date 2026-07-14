@@ -34,7 +34,7 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
     business_unit_id = Column(UUID(as_uuid=True), ForeignKey("business_units.id"), nullable=True)
-    role = Column(String, nullable=False, default="member")  # member | bu_admin | org_admin
+    role = Column(String, nullable=False, default="member")  # member | bu_admin | org_admin | legal
     created_at = Column(DateTime, default=datetime.utcnow)
 
     contracts = relationship("Contract", back_populates="user", cascade="all, delete-orphan")
@@ -77,6 +77,11 @@ class Contract(Base):
     business_unit_id = Column(UUID(as_uuid=True), ForeignKey("business_units.id"), nullable=True, index=True)
     completeness_score = Column(Float, nullable=True)
 
+    # Business lifecycle (orthogonal to `status`, which is the AI pipeline state).
+    lifecycle_stage = Column(String, nullable=True, index=True)  # DRAFT, INTERNAL_REVIEW, ...
+    party = Column(String, nullable=True)                        # internal | counterparty (of THIS version)
+    round = Column(Integer, default=0)                           # negotiation round-trip index
+
     # Store aggregated analysis like overall risk score, key obligations, etc.
     metadata_json = Column(JSONB, default={})
 
@@ -118,11 +123,46 @@ class ContractEvent(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id"), nullable=False, index=True)
 
-    event_type = Column(String, nullable=False)  # e.g. status, llm, error
+    event_type = Column(String, nullable=False)  # e.g. status, llm, error, lifecycle
     message = Column(Text, nullable=False)
     payload_json = Column(JSONB, default={})
 
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ContractTransition(Base):
+    """Actor-attributed lifecycle audit trail — one row per stage change."""
+    __tablename__ = "contract_transitions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    from_stage = Column(String, nullable=True)
+    to_stage = Column(String, nullable=False)
+    actor_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    party = Column(String, nullable=True)     # internal | counterparty
+    round = Column(Integer, default=0)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class Approval(Base):
+    """A human-in-the-loop sign-off gate on an AI-produced artifact / stage advance."""
+    __tablename__ = "approvals"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="CASCADE"), nullable=False, index=True)
+    stage = Column(String, nullable=True)              # the gate stage
+    artifact_type = Column(String, nullable=False)     # deviation_review | vendor_email | redline_package | stage_advance
+    artifact_ref = Column(JSONB, default={})           # the artifact payload (e.g. drafted email)
+    status = Column(String, nullable=False, default="PENDING")  # PENDING|APPROVED|REJECTED|CHANGES_REQUESTED
+    requested_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    assigned_role = Column(String, nullable=False, default="org_admin")
+    decided_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    decision_note = Column(Text, nullable=True)
+    target_stage = Column(String, nullable=True)       # stage to advance to on APPROVE
+    business_unit_id = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    decided_at = Column(DateTime, nullable=True)
 
 
 class ClauseFeedback(Base):

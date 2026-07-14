@@ -195,6 +195,84 @@ def bu_scope_criterion(user):
     return Contract.user_id == user.id
 
 
+# ---------------------------------------------------------------------------
+# Contract lifecycle state machine (business workflow — orthogonal to `status`)
+# ---------------------------------------------------------------------------
+
+LIFECYCLE_STAGES = [
+    "DRAFT", "INTERNAL_REVIEW", "SENT_TO_SUPPLIER", "NEGOTIATION",
+    "LEGAL_APPROVAL", "SIGNATURE", "EXECUTED", "ACTIVE", "EXPIRED", "TERMINATED",
+]
+
+# Human-readable labels + which "side" owns the stage (for the flow diagram).
+STAGE_META = {
+    "DRAFT":            {"label": "Draft",           "owner": "internal"},
+    "INTERNAL_REVIEW":  {"label": "Internal Review", "owner": "internal"},
+    "SENT_TO_SUPPLIER": {"label": "Sent to Supplier","owner": "counterparty"},
+    "NEGOTIATION":      {"label": "Negotiation",     "owner": "internal"},
+    "LEGAL_APPROVAL":   {"label": "Legal Approval",  "owner": "legal"},
+    "SIGNATURE":        {"label": "Signature",       "owner": "internal"},
+    "EXECUTED":         {"label": "Executed",        "owner": "internal"},
+    "ACTIVE":           {"label": "Active",          "owner": "internal"},
+    "EXPIRED":          {"label": "Expired",         "owner": "terminal"},
+    "TERMINATED":       {"label": "Terminated",      "owner": "terminal"},
+}
+
+ALLOWED_TRANSITIONS = {
+    "DRAFT": ["INTERNAL_REVIEW"],
+    "INTERNAL_REVIEW": ["SENT_TO_SUPPLIER", "LEGAL_APPROVAL"],
+    "SENT_TO_SUPPLIER": ["NEGOTIATION", "INTERNAL_REVIEW"],
+    "NEGOTIATION": ["SENT_TO_SUPPLIER", "LEGAL_APPROVAL"],
+    "LEGAL_APPROVAL": ["SIGNATURE", "NEGOTIATION"],
+    "SIGNATURE": ["EXECUTED"],
+    "EXECUTED": ["ACTIVE"],
+    "ACTIVE": ["EXPIRED"],
+    "EXPIRED": [],
+    "TERMINATED": [],
+}
+
+# Gated edges require an APPROVED approval before the transition may occur.
+# Value = the assigned_role that must sign off.
+GATED_TRANSITIONS = {
+    ("INTERNAL_REVIEW", "SENT_TO_SUPPLIER"): "bu_admin",
+    ("NEGOTIATION", "SENT_TO_SUPPLIER"): "bu_admin",
+    ("LEGAL_APPROVAL", "SIGNATURE"): "legal",
+}
+
+ROLE_RANK = {"member": 0, "legal": 1, "bu_admin": 1, "org_admin": 2}
+
+
+def role_rank(r: str | None) -> int:
+    return ROLE_RANK.get(r or "member", 0)
+
+
+def can_decide_approval(user, approval) -> bool:
+    """Approval authority: exact assigned-role match, or org_admin super-approver."""
+    urole = getattr(user, "role", None) or "member"
+    return urole == approval.assigned_role or urole == "org_admin"
+
+
+def log_transition(db, contract, from_stage, to_stage, actor_user_id=None, party=None, note=None):
+    """Write the actor-attributed transition row AND mirror it to the events feed."""
+    from .models import ContractTransition
+    db.add(ContractTransition(
+        contract_id=contract.id, from_stage=from_stage, to_stage=to_stage,
+        actor_user_id=actor_user_id, party=party or contract.party,
+        round=contract.round or 0, note=note,
+    ))
+    log_contract_event(db, str(contract.id), "lifecycle",
+                       f"{from_stage or 'START'} → {to_stage}",
+                       {"from": from_stage, "to": to_stage, "note": note})
+
+
+def set_lifecycle_stage(contract, stage):
+    """Set the promoted column + dual-write metadata_json (copy-dict gotcha)."""
+    contract.lifecycle_stage = stage
+    meta = dict(contract.metadata_json or {})
+    meta["lifecycle_stage"] = stage
+    contract.metadata_json = meta
+
+
 def _resolve_business_unit(db, current_user, business_unit_id: str | None):
     """BU for a new contract: explicit choice -> uploader's BU. Returns (id, name)."""
     from .models import BusinessUnit
@@ -225,11 +303,26 @@ def log_contract_event(db: Session, contract_id: str, event_type: str, message: 
     )
 
 
+def _version_fields(parent_contract, party_param):
+    """Compute (party, round, lifecycle_stage) for a new version off a parent.
+
+    A counterparty version bumps the round and lands in NEGOTIATION (their
+    returned redlines are ours to review); an internal revision inherits round
+    and the parent's stage.
+    """
+    party = "counterparty" if (party_param or "internal").lower() == "counterparty" else "internal"
+    parent_round = parent_contract.round or 0
+    if party == "counterparty":
+        return party, parent_round + 1, "NEGOTIATION"
+    return party, parent_round, (parent_contract.lifecycle_stage or "INTERNAL_REVIEW")
+
+
 @app.post("/api/v1/contracts/text")
 async def create_contract_from_text(
     payload: ContractTextIn,
     background_tasks: BackgroundTasks,
     parent_id: str | None = None,
+    party: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -278,6 +371,7 @@ async def create_contract_from_text(
     metadata = {"raw_text": raw_text, **meta}
     parent_contract = None
     version_number = 1
+    v_party, v_round, v_stage = "internal", 0, None
     if parent_id:
         parent_contract = db.query(Contract).filter(Contract.id == parent_id, Contract.user_id == current_user.id).first()
         if parent_contract:
@@ -285,6 +379,8 @@ async def create_contract_from_text(
             version_number = parent_version + 1
             metadata["parent_contract_id"] = parent_id
             metadata["version_number"] = version_number
+            v_party, v_round, v_stage = _version_fields(parent_contract, party)
+            metadata["lifecycle_stage"] = v_stage
 
     bu_id, bu_name = _resolve_business_unit(db, current_user, payload.business_unit_id)
     new_contract = Contract(
@@ -295,10 +391,17 @@ async def create_contract_from_text(
         user_id=current_user.id,
         business_unit_id=bu_id,
         business_unit=bu_name,
+        party=v_party,
+        round=v_round,
+        lifecycle_stage=v_stage,
     )
     db.add(new_contract)
     db.flush()
     log_contract_event(db, str(new_contract.id), "ingest", "Text submitted for analysis", {"cache": "miss", "mode": "text"})
+    if parent_contract is not None and v_party == "counterparty":
+        log_transition(db, new_contract, "SENT_TO_SUPPLIER", "NEGOTIATION",
+                       actor_user_id=current_user.id, party="counterparty",
+                       note="Counterparty returned redlines")
     db.commit()
     db.refresh(new_contract)
 
@@ -469,6 +572,59 @@ async def startup_event():
         ]:
             conn.execute(text(ddl))
 
+    # Contract lifecycle workflow: stage columns + transition audit + approval gates
+    with engine.begin() as conn:
+        for ddl in [
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS lifecycle_stage text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS party text;",
+            "ALTER TABLE contracts ADD COLUMN IF NOT EXISTS round integer DEFAULT 0;",
+            "CREATE INDEX IF NOT EXISTS ix_contracts_lifecycle_stage ON contracts(lifecycle_stage);",
+            "CREATE TABLE IF NOT EXISTS contract_transitions ("
+            "  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), "
+            "  contract_id uuid NOT NULL REFERENCES contracts(id) ON DELETE CASCADE, "
+            "  from_stage text, to_stage text NOT NULL, "
+            "  actor_user_id uuid REFERENCES users(id) ON DELETE SET NULL, "
+            "  party text, round integer DEFAULT 0, note text, "
+            "  created_at timestamptz NOT NULL DEFAULT now());",
+            "CREATE INDEX IF NOT EXISTS ix_contract_transitions_contract ON contract_transitions(contract_id, created_at);",
+            "CREATE TABLE IF NOT EXISTS approvals ("
+            "  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), "
+            "  contract_id uuid NOT NULL REFERENCES contracts(id) ON DELETE CASCADE, "
+            "  stage text, artifact_type text NOT NULL, artifact_ref jsonb DEFAULT '{}'::jsonb, "
+            "  status text NOT NULL DEFAULT 'PENDING', "
+            "  requested_by uuid REFERENCES users(id) ON DELETE SET NULL, "
+            "  assigned_role text NOT NULL DEFAULT 'org_admin', "
+            "  decided_by uuid REFERENCES users(id) ON DELETE SET NULL, "
+            "  decision_note text, target_stage text, business_unit_id uuid, "
+            "  created_at timestamptz NOT NULL DEFAULT now(), decided_at timestamptz);",
+            "CREATE INDEX IF NOT EXISTS ix_approvals_status_role ON approvals(status, assigned_role);",
+            "CREATE INDEX IF NOT EXISTS ix_approvals_contract ON approvals(contract_id);",
+        ]:
+            conn.execute(text(ddl))
+
+    # Backfill lifecycle_stage for existing contracts (idempotent, every row ends non-null)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE contracts SET lifecycle_stage='INTERNAL_REVIEW' "
+            "WHERE lifecycle_stage IS NULL AND status='COMPLETED';"
+        ))
+        conn.execute(text(
+            "UPDATE contracts SET lifecycle_stage='ACTIVE' "
+            "WHERE lifecycle_stage='INTERNAL_REVIEW' AND effective_date IS NOT NULL "
+            "AND effective_date <= now()::date AND (expiry_date IS NULL OR expiry_date >= now()::date);"
+        ))
+        conn.execute(text(
+            "UPDATE contracts SET lifecycle_stage='EXPIRED' "
+            "WHERE lifecycle_stage IN ('INTERNAL_REVIEW','ACTIVE') "
+            "AND expiry_date IS NOT NULL AND expiry_date < now()::date;"
+        ))
+        conn.execute(text("UPDATE contracts SET lifecycle_stage='DRAFT' WHERE lifecycle_stage IS NULL;"))
+        conn.execute(text("UPDATE contracts SET party=COALESCE(party,'internal'), round=COALESCE(round,0);"))
+        conn.execute(text(
+            "UPDATE contracts SET metadata_json=jsonb_set(coalesce(metadata_json,'{}'::jsonb), "
+            "'{lifecycle_stage}', to_jsonb(lifecycle_stage)) WHERE lifecycle_stage IS NOT NULL;"
+        ))
+
     # One-time cheap backfill: copy regex-era JSONB fields into the new columns.
     with engine.begin() as conn:
         conn.execute(text(
@@ -556,6 +712,18 @@ async def startup_event():
                 role="member",
             )
             db.add(analyst)
+
+        # Legal/governance approver — dedicated role for human-in-the-loop sign-off
+        legal = db.query(User).filter(User.email == "legal@ge.demo").first()
+        if not legal:
+            legal = User(
+                email="legal@ge.demo",
+                hashed_password=get_password_hash("legal"),
+                org_id=org.id,
+                business_unit_id=first_bu.id if first_bu else None,
+                role="legal",
+            )
+            db.add(legal)
 
         # Attach org/BU to any users still missing one (e.g. self-signups)
         for u in db.query(User).filter(User.org_id.is_(None)).all():
@@ -1030,6 +1198,14 @@ async def analyze_contract_background(contract_id: str, raw_text: str):
                 # Structured + dynamic metadata extraction (promoted columns)
                 await _extract_and_save_metadata(contract, raw_text)
 
+                # Lifecycle: a freshly-analyzed draft auto-advances to Internal Review.
+                # (Counterparty revisions are set to NEGOTIATION at upload, so this only
+                # moves brand-new v1 drafts forward.)
+                if (contract.lifecycle_stage or "DRAFT") == "DRAFT":
+                    log_transition(db, contract, "DRAFT", "INTERNAL_REVIEW",
+                                   actor_user_id=None, note="AI analysis completed")
+                    set_lifecycle_stage(contract, "INTERNAL_REVIEW")
+
                 existing = contract.metadata_json or {}
                 contract.metadata_json = {**existing, **analysis_meta}
                 log_contract_event(db, contract_id, "analysis", "Analysis completed", analysis_meta)
@@ -1130,10 +1306,11 @@ async def get_recent_events(
 
 @app.post("/api/v1/contracts/upload")
 async def upload_contract(
-    background_tasks: BackgroundTasks, 
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     parent_id: str | None = None,
     business_unit_id: str | None = None,
+    party: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1182,19 +1359,22 @@ async def upload_contract(
     # 3. Create Contract Record
     parent_contract = None
     version_number = 1
+    v_party, v_round, v_stage = "internal", 0, None
     if parent_id:
         parent_contract = db.query(Contract).filter(Contract.id == parent_id, Contract.user_id == current_user.id).first()
         if parent_contract:
             parent_version = parent_contract.metadata_json.get("version_number", 1) if parent_contract.metadata_json else 1
             version_number = parent_version + 1
-            
+            v_party, v_round, v_stage = _version_fields(parent_contract, party)
+
     metadata = {"raw_text": raw_text, **meta}
     if parent_id and parent_contract:
         metadata["parent_contract_id"] = parent_id
         metadata["version_number"] = version_number
+        metadata["lifecycle_stage"] = v_stage
     else:
         metadata["version_number"] = 1
-        
+
     bu_id, bu_name = _resolve_business_unit(db, current_user, business_unit_id)
     new_contract = Contract(
         filename=std_name,
@@ -1203,11 +1383,18 @@ async def upload_contract(
         metadata_json=metadata,
         user_id=current_user.id,
         business_unit_id=bu_id,
-        business_unit=bu_name
+        business_unit=bu_name,
+        party=v_party,
+        round=v_round,
+        lifecycle_stage=v_stage,
     )
     db.add(new_contract)
     db.flush()
     log_contract_event(db, str(new_contract.id), "ingest", "PDF uploaded for analysis", {"cache": "miss", "mode": "pdf"})
+    if parent_contract is not None and v_party == "counterparty":
+        log_transition(db, new_contract, "SENT_TO_SUPPLIER", "NEGOTIATION",
+                       actor_user_id=current_user.id, party="counterparty",
+                       note="Counterparty returned redlines")
     db.commit()
     db.refresh(new_contract)
     
@@ -1525,6 +1712,9 @@ async def list_contracts(
             "currency": c.currency,
             "business_unit": c.business_unit,
             "completeness_score": c.completeness_score,
+            "lifecycle_stage": c.lifecycle_stage,
+            "party": c.party,
+            "round": c.round,
             "overall_risk": overall_risk if c.status == ContractStatus.COMPLETED else None,
             "created_at": c.created_at.isoformat()
         })
@@ -1722,6 +1912,9 @@ async def get_contract(
             "filename": contract.filename,
             "status": contract.status.value,
             "metadata_json": contract.metadata_json,
+            "lifecycle_stage": contract.lifecycle_stage,
+            "party": contract.party,
+            "round": contract.round,
             "overall_risk": overall_risk if contract.status == ContractStatus.COMPLETED else None,
             "created_at": contract.created_at.isoformat()
         }
@@ -1930,7 +2123,8 @@ async def signup(payload: UserSignupIn, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "user": {
             "id": str(user.id),
-            "email": user.email
+            "email": user.email,
+            "role": getattr(user, "role", None) or "member"
         }
     }
 
@@ -1947,7 +2141,8 @@ async def login(payload: UserLoginIn, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "user": {
             "id": str(user.id),
-            "email": user.email
+            "email": user.email,
+            "role": getattr(user, "role", None) or "member"
         }
     }
 
@@ -3918,6 +4113,383 @@ async def unlink_related_document(
     db.delete(rel)
     db.commit()
     return {"message": "Unlinked"}
+
+
+
+
+# ---------------------------------------------------------------------------
+# Contract lifecycle: workflow state, transitions, version lineage
+# ---------------------------------------------------------------------------
+
+def _pending_approvals_for(db, contract_id):
+    from .models import Approval
+    return (db.query(Approval)
+            .filter(Approval.contract_id == contract_id, Approval.status == "PENDING")
+            .all())
+
+
+def _approval_row(a) -> dict:
+    return {
+        "id": str(a.id),
+        "contract_id": str(a.contract_id),
+        "stage": a.stage,
+        "artifact_type": a.artifact_type,
+        "artifact_ref": a.artifact_ref or {},
+        "status": a.status,
+        "assigned_role": a.assigned_role,
+        "target_stage": a.target_stage,
+        "decision_note": a.decision_note,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "decided_at": a.decided_at.isoformat() if a.decided_at else None,
+    }
+
+
+def _allowed_next(contract, user, pendings):
+    """Allowed next stages for this user, annotated with gate/role info."""
+    stage = contract.lifecycle_stage or "DRAFT"
+    out = []
+    for nxt in ALLOWED_TRANSITIONS.get(stage, []):
+        gate_role = GATED_TRANSITIONS.get((stage, nxt))
+        entry = {
+            "to_stage": nxt,
+            "label": STAGE_META.get(nxt, {}).get("label", nxt),
+            "gated": gate_role is not None,
+            "gate_role": gate_role,
+            "can_drive": role_rank(getattr(user, "role", None)) >= role_rank(gate_role) if gate_role else True,
+        }
+        out.append(entry)
+    # org_admin escape hatch: TERMINATED from any non-terminal
+    if stage not in ("EXPIRED", "TERMINATED") and (getattr(user, "role", None) == "org_admin"):
+        out.append({"to_stage": "TERMINATED", "label": "Terminated", "gated": False,
+                    "gate_role": None, "can_drive": True})
+    return out
+
+
+@app.get("/api/v1/contracts/{contract_id}/workflow")
+async def get_workflow(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import ContractTransition, Approval
+    contract = get_accessible_contract(db, contract_id, current_user)
+    pendings = _pending_approvals_for(db, contract.id)
+    transitions = (db.query(ContractTransition, User)
+                   .outerjoin(User, ContractTransition.actor_user_id == User.id)
+                   .filter(ContractTransition.contract_id == contract.id)
+                   .order_by(ContractTransition.created_at)
+                   .all())
+    return {
+        "current_stage": contract.lifecycle_stage or "DRAFT",
+        "party": contract.party or "internal",
+        "round": contract.round or 0,
+        "stages": [{"stage": s, **STAGE_META.get(s, {})} for s in LIFECYCLE_STAGES],
+        "allowed_transitions": _allowed_next(contract, current_user, pendings),
+        "gate_blocked": any(p.artifact_type == "stage_advance" for p in pendings),
+        "pending_approvals": [_approval_row(a) for a in pendings],
+        "transitions": [
+            {
+                "from_stage": t.from_stage, "to_stage": t.to_stage,
+                "actor": u.email if u else "system",
+                "party": t.party, "round": t.round, "note": t.note,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t, u in transitions
+        ],
+    }
+
+
+class TransitionIn(BaseModel):
+    to_stage: str
+    note: str | None = None
+
+
+@app.post("/api/v1/contracts/{contract_id}/transition")
+async def transition_contract(
+    contract_id: str,
+    payload: TransitionIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import Approval
+    contract = get_accessible_contract(db, contract_id, current_user)
+    frm = contract.lifecycle_stage or "DRAFT"
+    to = (payload.to_stage or "").strip().upper()
+
+    # TERMINATED is the org_admin escape hatch from any non-terminal stage.
+    is_terminate = to == "TERMINATED" and frm not in ("EXPIRED", "TERMINATED")
+    if not is_terminate and to not in ALLOWED_TRANSITIONS.get(frm, []):
+        raise HTTPException(status_code=400, detail=f"Cannot move from {frm} to {to}")
+    if is_terminate and (getattr(current_user, "role", None) != "org_admin"):
+        raise HTTPException(status_code=403, detail="Only an org admin may terminate a contract")
+
+    gate_role = GATED_TRANSITIONS.get((frm, to))
+    if gate_role:
+        # Require an APPROVED approval targeting this stage; else block with 409.
+        approved = (db.query(Approval)
+                    .filter(Approval.contract_id == contract.id,
+                            Approval.target_stage == to,
+                            Approval.status == "APPROVED")
+                    .first())
+        if not approved:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This step requires {gate_role} approval before it can proceed. "
+                       f"Request approval first.")
+
+    # Role check for driving the transition (non-gated manual moves).
+    if role_rank(getattr(current_user, "role", None)) < role_rank(gate_role):
+        raise HTTPException(status_code=403, detail="Insufficient role for this transition")
+
+    log_transition(db, contract, frm, to, actor_user_id=current_user.id, note=payload.note)
+    set_lifecycle_stage(contract, to)
+    db.commit()
+    return await get_workflow(contract_id, db, current_user)
+
+
+@app.get("/api/v1/contracts/{contract_id}/lineage")
+async def get_lineage(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full version chain (root → all descendants) with round-trip annotations."""
+    contract = get_accessible_contract(db, contract_id, current_user)
+    # All contracts the user can see, to reconstruct the chain (versions share a thread).
+    universe = db.query(Contract).filter(bu_scope_criterion(current_user)).all()
+    by_id = {str(c.id): c for c in universe}
+    if str(contract.id) not in by_id:
+        by_id[str(contract.id)] = contract
+
+    def parent_of(c):
+        return (c.metadata_json or {}).get("parent_contract_id")
+
+    # Walk up to the root.
+    root = contract
+    guard = 0
+    while parent_of(root) and by_id.get(parent_of(root)) and guard < 50:
+        root = by_id[parent_of(root)]
+        guard += 1
+
+    # Walk down: build child map, follow from root.
+    children = {}
+    for c in by_id.values():
+        p = parent_of(c)
+        if p:
+            children.setdefault(p, []).append(c)
+    chain, cur, guard = [], root, 0
+    seen = set()
+    while cur and guard < 100 and str(cur.id) not in seen:
+        seen.add(str(cur.id))
+        chain.append(cur)
+        kids = sorted(children.get(str(cur.id), []),
+                      key=lambda k: (k.metadata_json or {}).get("version_number", 1))
+        cur = kids[0] if kids else None
+        guard += 1
+
+    versions = []
+    for c in chain:
+        resolutions = (c.metadata_json or {}).get("redline_resolutions") or []
+        versions.append({
+            "id": str(c.id),
+            "version_number": (c.metadata_json or {}).get("version_number", 1),
+            "party": c.party or "internal",
+            "round": c.round or 0,
+            "filename": c.filename,
+            "status": c.status.value if c.status else None,
+            "lifecycle_stage": c.lifecycle_stage,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "changed_clauses": len(resolutions),
+            "resolved_clauses": sum(1 for r in resolutions if r.get("status") == "RESOLVED"),
+            "is_current": str(c.id) == str(contract.id),
+        })
+    return {"versions": versions, "thread_length": len(versions)}
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop approval gates
+# ---------------------------------------------------------------------------
+
+class ApprovalCreateIn(BaseModel):
+    contract_id: str
+    stage: str | None = None
+    artifact_type: str = "stage_advance"   # deviation_review | vendor_email | redline_package | stage_advance
+    artifact_ref: dict = {}
+    assigned_role: str | None = None
+    target_stage: str | None = None
+
+
+@app.post("/api/v1/approvals")
+async def create_approval(
+    payload: ApprovalCreateIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import Approval
+    contract = get_accessible_contract(db, payload.contract_id, current_user)
+    # Default the approver role from the gate the target stage implies.
+    assigned = payload.assigned_role
+    if not assigned and payload.target_stage:
+        assigned = GATED_TRANSITIONS.get((contract.lifecycle_stage or "", payload.target_stage))
+    assigned = assigned or "org_admin"
+
+    approval = Approval(
+        contract_id=contract.id,
+        stage=payload.stage or contract.lifecycle_stage,
+        artifact_type=payload.artifact_type,
+        artifact_ref=payload.artifact_ref or {},
+        status="PENDING",
+        requested_by=current_user.id,
+        assigned_role=assigned,
+        target_stage=payload.target_stage,
+        business_unit_id=contract.business_unit_id,
+    )
+    db.add(approval)
+    log_contract_event(db, str(contract.id), "approval_requested",
+                       f"Approval requested ({payload.artifact_type}) → {assigned}",
+                       {"target_stage": payload.target_stage, "assigned_role": assigned})
+    db.commit()
+    db.refresh(approval)
+    return _approval_row(approval)
+
+
+class ApprovalDecideIn(BaseModel):
+    decision: str            # APPROVED | REJECTED | CHANGES_REQUESTED
+    note: str | None = None
+
+
+@app.post("/api/v1/approvals/{approval_id}/decide")
+async def decide_approval(
+    approval_id: str,
+    payload: ApprovalDecideIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import Approval
+    approval = db.query(Approval).filter(Approval.id == approval_id).first()
+    if not approval:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    contract = get_accessible_contract(db, str(approval.contract_id), current_user)
+    if approval.status != "PENDING":
+        raise HTTPException(status_code=409, detail=f"Approval already {approval.status}")
+    if not can_decide_approval(current_user, approval):
+        raise HTTPException(status_code=403,
+                            detail=f"Only {approval.assigned_role} (or an org admin) can decide this approval")
+
+    decision = (payload.decision or "").strip().upper()
+    if decision not in {"APPROVED", "REJECTED", "CHANGES_REQUESTED"}:
+        raise HTTPException(status_code=400, detail="Invalid decision")
+
+    approval.status = decision
+    approval.decided_by = current_user.id
+    approval.decision_note = payload.note
+    approval.decided_at = datetime.utcnow()
+    log_contract_event(db, str(contract.id), "approval_decided",
+                       f"Approval {decision} by {current_user.email}",
+                       {"artifact_type": approval.artifact_type, "note": payload.note})
+
+    if decision == "APPROVED" and approval.target_stage:
+        frm = contract.lifecycle_stage or "DRAFT"
+        to = approval.target_stage
+        # perform the deferred transition only if it's still a valid edge — the
+        # contract may have moved since the approval was requested.
+        if to in ALLOWED_TRANSITIONS.get(frm, []):
+            log_transition(db, contract, frm, to, actor_user_id=current_user.id,
+                           note=f"Approved: {approval.artifact_type}")
+            set_lifecycle_stage(contract, to)
+        if approval.artifact_type in ("vendor_email", "redline_package"):
+            ref = dict(approval.artifact_ref or {})
+            ref["sent"] = True
+            approval.artifact_ref = ref
+    elif decision in ("REJECTED", "CHANGES_REQUESTED"):
+        # bounce back to negotiation if we were awaiting legal sign-off
+        if (contract.lifecycle_stage or "") == "LEGAL_APPROVAL":
+            log_transition(db, contract, "LEGAL_APPROVAL", "NEGOTIATION",
+                           actor_user_id=current_user.id, note="Changes requested")
+            set_lifecycle_stage(contract, "NEGOTIATION")
+
+    db.commit()
+    db.refresh(approval)
+    return _approval_row(approval)
+
+
+@app.get("/api/v1/contracts/{contract_id}/approvals")
+async def list_contract_approvals(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from .models import Approval
+    contract = get_accessible_contract(db, contract_id, current_user)
+    rows = (db.query(Approval).filter(Approval.contract_id == contract.id)
+            .order_by(Approval.created_at.desc()).all())
+    return {"approvals": [_approval_row(a) for a in rows]}
+
+
+@app.get("/api/v1/approvals")
+async def my_approval_queue(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pending approvals I can act on — my role (or org_admin sees all), BU-scoped."""
+    from .models import Approval
+    urole = getattr(current_user, "role", None) or "member"
+    q = (db.query(Approval, Contract)
+         .join(Contract, Approval.contract_id == Contract.id)
+         .filter(Approval.status == "PENDING", bu_scope_criterion(current_user)))
+    if urole != "org_admin":
+        q = q.filter(Approval.assigned_role == urole)
+    rows = q.order_by(Approval.created_at.desc()).limit(100).all()
+    return {"approvals": [
+        {**_approval_row(a),
+         "contract_filename": c.filename,
+         "contract_counterparty": c.counterparty or c.company,
+         "lifecycle_stage": c.lifecycle_stage}
+        for a, c in rows
+    ]}
+
+
+class VendorEmailSendIn(BaseModel):
+    subject: str
+    body: str
+    target_stage: str = "SENT_TO_SUPPLIER"
+
+
+@app.post("/api/v1/contracts/{contract_id}/redlines/send")
+async def send_vendor_email_for_approval(
+    contract_id: str,
+    payload: VendorEmailSendIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Human-in-the-loop: an AI-drafted vendor email is NOT sent directly — it is
+    parked as a PENDING approval. A manager (bu_admin) / org_admin signs off, and on
+    approval the contract advances to SENT_TO_SUPPLIER and the email is marked sent."""
+    from .models import Approval
+    contract = get_accessible_contract(db, contract_id, current_user)
+    frm = contract.lifecycle_stage or "DRAFT"
+    to = payload.target_stage
+    gate_role = GATED_TRANSITIONS.get((frm, to)) or "bu_admin"
+
+    approval = Approval(
+        contract_id=contract.id,
+        stage=frm,
+        artifact_type="vendor_email",
+        artifact_ref={"subject": payload.subject, "body": payload.body, "sent": False},
+        status="PENDING",
+        requested_by=current_user.id,
+        assigned_role=gate_role,
+        target_stage=to,
+        business_unit_id=contract.business_unit_id,
+    )
+    db.add(approval)
+    log_contract_event(db, str(contract.id), "approval_requested",
+                       f"Vendor email awaiting {gate_role} approval before sending",
+                       {"target_stage": to})
+    db.commit()
+    db.refresh(approval)
+    return {"approval": _approval_row(approval),
+            "message": f"Email queued for {gate_role} approval before it is sent."}
 
 
 # ---------------------------------------------------------------------------
