@@ -24,3 +24,8 @@ venv/
 
 # Local embedded Postgres data (pgserver)
 postgres-local/
+
+# Stray root-level tooling installs (localtunnel etc.) — app deps live in frontend/ and backend/
+/node_modules/
+/package.json
+/package-lock.json
