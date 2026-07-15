@@ -24,9 +24,10 @@ services:
       - .env
     depends_on:
       - db
-      - redis
     command: uvicorn app.main:app --host 0.0.0.0 --port 9432 --reload
 
+  # Postgres 16 WITH pgvector preinstalled. The app creates the `vector` extension and all
+  # tables itself on first boot, and seeds admin@admin.com / admin — no manual DB setup.
   db:
     image: pgvector/pgvector:pg16
     ports:
@@ -35,10 +36,3 @@ services:
       - .env
     volumes:
       - ./postgres:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - ./redis:/data

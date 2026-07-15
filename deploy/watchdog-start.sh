@@ -23,8 +23,10 @@ URL=$(grep -hoE "https://[a-z0-9-]+\.trycloudflare\.com" "$CF_LOG" | head -1)
 echo "Current tunnel: $URL"
 
 # Proxy dir is gitignored (per-account link state) — create it on the fly.
+# IMPORTANT: rewrites-only proxy, NO static index.html — a static file at / would shadow the
+# "/" rewrite and Vercel would serve it instead of forwarding to the app.
 mkdir -p "$PROXY_DIR"
-[ -f "$PROXY_DIR/index.html" ] || printf '<!doctype html><meta charset="utf-8"><title>ContractsPulse</title><p>Loading ContractsPulse…</p>\n' > "$PROXY_DIR/index.html"
+rm -f "$PROXY_DIR/index.html"
 
 cat > "$PROXY_DIR/vercel.json" <<EOF
 {
