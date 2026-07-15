@@ -289,6 +289,26 @@
 	// Table rows: smart-search results replace the normal filtered list
 	let displayedContracts = $derived(smartActive ? smartResults : filteredContracts);
 
+	// Repository at-a-glance chips (E6): lifecycle stage, off-standard count, pending approvals.
+	function stageLabel(stage: string | null | undefined): string {
+		if (!stage) return '';
+		return stage.split('_').map((w) => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
+	}
+	function stageBadge(stage: string | null | undefined): string {
+		switch (stage) {
+			case 'DRAFT':
+			case 'INTERNAL_REVIEW': return 'badge-blue';
+			case 'SENT_TO_SUPPLIER':
+			case 'NEGOTIATION': return 'badge-purple';
+			case 'LEGAL_APPROVAL': return 'badge-warning';
+			case 'SIGNATURE': return 'badge-blue';
+			case 'EXECUTED':
+			case 'ACTIVE': return 'badge-success';
+			case 'TERMINATED': return 'badge-danger';
+			default: return 'badge-secondary';
+		}
+	}
+
 	async function fetchContracts(silent = false) {
 		if (!silent) isLoading = true;
 		try {
@@ -852,6 +872,22 @@
 							></span>
 						{/if}
 					</div>
+					{#if contract.status === 'COMPLETED' && ((contract as any).lifecycle_stage || (contract.metadata_json?.deviation_analysis?.summary?.off_playbook ?? 0) > 0 || ((contract as any).pending_approvals ?? 0) > 0 || contract.metadata_json?.needs_review)}
+						<div class="terms-line repo-chips">
+							{#if (contract as any).lifecycle_stage}
+								<span class="badge badge-sm {stageBadge((contract as any).lifecycle_stage)}">{stageLabel((contract as any).lifecycle_stage)}</span>
+							{/if}
+							{#if (contract.metadata_json?.deviation_analysis?.summary?.off_playbook ?? 0) > 0}
+								<span class="badge badge-sm badge-warning" title="Clauses off our standard">{contract.metadata_json.deviation_analysis.summary.off_playbook} off-standard</span>
+							{/if}
+							{#if ((contract as any).pending_approvals ?? 0) > 0}
+								<span class="badge badge-sm badge-purple" title="Pending approvals">{(contract as any).pending_approvals} pending approval{(contract as any).pending_approvals === 1 ? '' : 's'}</span>
+							{/if}
+							{#if contract.metadata_json?.needs_review}
+								<span class="badge badge-sm badge-danger" title="Extraction was incomplete — needs a human check">Needs review</span>
+							{/if}
+						</div>
+					{/if}
 				</div>
 
 				<!-- Status Badge -->
@@ -1892,6 +1928,11 @@
 	.terms-sub {
 		font-size: 11px;
 		color: var(--text-tertiary);
+	}
+	.repo-chips {
+		flex-wrap: wrap;
+		gap: 4px;
+		margin-top: 3px;
 	}
 	.completeness-dot {
 		width: 7px;

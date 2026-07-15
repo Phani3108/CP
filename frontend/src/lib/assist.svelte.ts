@@ -1,7 +1,7 @@
 import { apiFetch } from './api';
 
 export type AssistAction = {
-	type: 'open_contract' | 'view_clause' | 'view_deviations' | 'copy_redline' | 'draft_email' | string;
+	type: 'open_contract' | 'view_clause' | 'view_deviations' | 'view_changes' | 'copy_redline' | 'draft_email' | string;
 	label: string;
 	contract_id?: string;
 	clause_type?: string;
@@ -17,7 +17,13 @@ export type AssistSource = {
 	text_excerpt?: string;
 };
 
-export type AssistMeta = { route?: string; query_scope?: string; conversation_mode?: string };
+export type AssistMeta = {
+	route?: string;
+	query_scope?: string;
+	conversation_mode?: string;
+	grounded?: boolean | null;
+	grounding_score?: number | null;
+};
 
 export type AssistResultRow = {
 	id: string;
@@ -84,7 +90,7 @@ function msgFromServer(m: any): AssistMsg {
 		actions: meta.actions || [],
 		suggested: meta.suggested_questions || [],
 		results: meta.results || [],
-		meta: { route: meta.route, query_scope: meta.query_scope }
+		meta: { route: meta.route, query_scope: meta.query_scope, grounded: meta.grounded, grounding_score: meta.grounding_score }
 	};
 }
 
@@ -252,7 +258,9 @@ class AssistState {
 					meta: {
 						route: json.route,
 						query_scope: json.query_scope,
-						conversation_mode: json.conversation_mode
+						conversation_mode: json.conversation_mode,
+						grounded: json.grounded,
+						grounding_score: json.grounding_score
 					}
 				}
 			];

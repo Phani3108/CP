@@ -4,7 +4,7 @@ import hashlib
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from backend.app.parser import _slugify, compute_file_hash, normalize_contract_text, compute_text_hash, extract_contract_metadata
+from backend.app.parser import _slugify, compute_file_hash, normalize_contract_text, compute_text_hash, extract_contract_metadata, standardized_filename
 
 def test_slugify_empty_string():
     assert _slugify("") == ""
@@ -198,3 +198,23 @@ def test_extract_contract_metadata_full():
     assert res["contract_term"] == "term of two (2) year"
     assert res["expiry_date"] == "2027-01-01"
     assert res["renewal_notice_days"] == 30
+
+
+def test_standardized_filename_with_company():
+    name = standardized_filename(
+        {"company": "Poppulo, Inc.", "contract_type": "MSA", "contract_date": "2024-03-15"},
+        "2026-07-14",
+    )
+    assert name == "2024-03-15__Poppulo-Inc__MSA.pdf"
+
+
+def test_standardized_filename_falls_back_to_upload_date():
+    name = standardized_filename({"company": "Acme", "contract_type": "NDA"}, "2026-07-14")
+    assert name == "2026-07-14__Acme__NDA.pdf"
+
+
+def test_standardized_filename_unknown_company_default():
+    # Documents the "unknown-company" fallback that the pipeline now avoids by recomputing the
+    # name from the LLM-extracted party once analysis completes.
+    name = standardized_filename({}, "2026-07-14")
+    assert "unknown-company" in name

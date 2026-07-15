@@ -42,6 +42,10 @@ export const toast = {
 		return id;
 	},
 	
+	info(message: string, duration = 3000) {
+		return this.show(message, 'info', duration);
+	},
+
 	success(message: string, duration = 3000) {
 		return this.show(message, 'success', duration);
 	},

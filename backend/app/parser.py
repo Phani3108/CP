@@ -183,7 +183,8 @@ def standardized_filename(metadata: dict, default_date: str) -> str:
     """
     Build: YYYY-MM-DD__company__contract-type.pdf, with safe fallbacks.
     """
-    contract_date = metadata.get("contract_date") or default_date
+    # Keep only the date part — some sources hand us a full ISO datetime (…T00:00:00).
+    contract_date = str(metadata.get("contract_date") or default_date)[:10]
     company = _slugify(metadata.get("company") or "unknown-company")
     ctype = _slugify(metadata.get("contract_type") or "contract")
     return f"{contract_date}__{company}__{ctype}.pdf"

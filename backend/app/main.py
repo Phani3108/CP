@@ -992,6 +992,94 @@ async def _verify_contract_redlines(db, contract, contract_id: str, analysis_met
                     print(f"Deep fallback verification failed: {he}")
 
 
+async def _compute_version_changes(db, contract, contract_id: str):
+    """Clause-level "what changed vs the previous version" diff — the Changes tab and
+    multi-turn (version-vs-version) deviation. Reuses build_version_diff over the parent
+    and current clauses. Pure/fast, no LLM — lands in the same COMPLETED commit and never
+    touches contract.status. Persists metadata_json["version_changes"] via a copied dict
+    (SQLAlchemy JSONB in-place-mutation gotcha)."""
+    from .models import Contract, ContractClause
+    existing = contract.metadata_json or {}
+    parent_id = existing.get("parent_contract_id")
+    if not parent_id:
+        return
+    try:
+        parent_clauses = db.query(ContractClause).filter(ContractClause.contract_id == parent_id).all()
+        new_clauses = db.query(ContractClause).filter(ContractClause.contract_id == contract_id).all()
+        from .deviation import build_version_diff
+        diff = build_version_diff(parent_clauses, new_clauses)
+        # Enrich with version identity for the UI + Assist deep-links.
+        parent = db.query(Contract).filter(Contract.id == parent_id).first()
+        diff["parent_contract_id"] = str(parent_id)
+        diff["parent_version_number"] = (parent.metadata_json or {}).get("version_number") if parent else None
+        diff["version_number"] = existing.get("version_number")
+        meta = dict(contract.metadata_json or {})
+        meta["version_changes"] = diff
+        contract.metadata_json = meta
+    except Exception as e:
+        print(f"Version-changes diff failed (non-fatal): {e}")
+
+
+MAX_ORIGINAL_FILE_BYTES = 30_000_000  # ~30 MB cap to keep the DB row sane
+
+
+def _store_original_file(db, contract_id, file_bytes: bytes, mime: str | None, orig_name: str | None):
+    """Persist (replacing any prior) the original uploaded document bytes for a contract, so the
+    cockpit can display the real document. Non-fatal; skips oversized files."""
+    from .models import ContractFile
+    if not file_bytes:
+        return
+    if len(file_bytes) > MAX_ORIGINAL_FILE_BYTES:
+        print(f"Original file too large to store ({len(file_bytes)} bytes) — skipping.")
+        return
+    try:
+        db.query(ContractFile).filter(ContractFile.contract_id == contract_id).delete()
+        db.add(ContractFile(
+            contract_id=contract_id,
+            content=file_bytes,
+            mime=(mime or "application/pdf"),
+            filename=(orig_name or "document.pdf"),
+            size=len(file_bytes),
+        ))
+    except Exception as e:
+        print(f"Store original file failed (non-fatal): {e}")
+
+
+async def _maybe_enqueue_round_deviation(db, contract, contract_id: str):
+    """Multi-turn deviation (Mode 1): re-run template deviation for this revision against
+    the SAME template the parent version used, so the off-standard trend is comparable
+    round-over-round. Only fires when the parent actually matched a ready template and this
+    round hasn't already been measured. LLM-heavy, so it runs after the COMPLETED commit."""
+    from .models import Contract, ContractTemplate, TemplateClause
+    existing = contract.metadata_json or {}
+    parent_id = existing.get("parent_contract_id")
+    if not parent_id or existing.get("matched_template_id"):
+        return
+    parent = db.query(Contract).filter(Contract.id == parent_id).first()
+    template_id = (parent.metadata_json or {}).get("matched_template_id") if parent else None
+    if not template_id:
+        return
+    template = db.query(ContractTemplate).filter(ContractTemplate.id == template_id).first()
+    if not template or (template.status or "") != "READY":
+        return
+    embedded = db.query(TemplateClause).filter(
+        TemplateClause.template_id == template_id, TemplateClause.embedding.isnot(None)
+    ).count()
+    if embedded == 0:
+        return
+    meta = dict(contract.metadata_json or {})
+    meta["matched_template_id"] = str(template_id)
+    meta["deviation_status"] = "RUNNING"
+    meta["paper_mode"] = "FIRST_PARTY"
+    meta["paper_mode_source"] = "auto_round"
+    contract.metadata_json = meta
+    db.commit()
+    try:
+        await run_deviation_analysis_background(contract_id, str(template_id))
+    except Exception as e:
+        print(f"Round deviation analysis failed (non-fatal): {e}")
+
+
 async def _extract_and_save_obligations(contract, raw_text: str):
     existing = contract.metadata_json or {}
     try:
@@ -1152,6 +1240,72 @@ async def _extract_and_save_metadata(contract, raw_text: str):
         except Exception:
             pass
 
+        # Verify-and-correct (T2): if the model was unsure or a required field is missing,
+        # run one focused re-extraction and fill only the gaps. Whatever is still missing is
+        # flagged needs_review so a human is prompted rather than inheriting a bad extraction.
+        REQUIRED_METADATA = ["counterparty", "contract_type", "effective_date", "expiry_date"]
+        missing = [f for f in REQUIRED_METADATA if getattr(contract, f) is None]
+        low_conf = (m.confidence is not None and m.confidence < 0.5)
+        if missing or low_conf:
+            try:
+                m2 = await extract_contract_metadata_llm(raw_text)
+                if contract.company is None:
+                    contract.company = m2.party_a or contract.company
+                if contract.counterparty is None:
+                    contract.counterparty = m2.party_b or contract.counterparty
+                if contract.contract_type is None and m2.contract_type:
+                    contract.contract_type = m2.contract_type if m2.contract_type in CONTRACT_TYPES else "OTHER"
+                if contract.effective_date is None:
+                    contract.effective_date = _parse_iso_date(m2.effective_date) or contract.effective_date
+                if contract.expiry_date is None:
+                    contract.expiry_date = _parse_iso_date(m2.expiry_date) or contract.expiry_date
+                if contract.total_value is None and m2.total_value is not None:
+                    contract.total_value = m2.total_value
+                if contract.governing_law is None:
+                    contract.governing_law = m2.governing_law or contract.governing_law
+                present = sum(1 for f in COMPLETENESS_FIELDS if getattr(contract, f) is not None)
+                contract.completeness_score = round(present / len(COMPLETENESS_FIELDS), 2)
+                existing["completeness_score"] = contract.completeness_score
+                for f in ("company", "counterparty", "contract_type", "governing_law"):
+                    if getattr(contract, f) is not None:
+                        existing[f] = getattr(contract, f)
+                if contract.effective_date:
+                    existing["contract_date"] = contract.effective_date.isoformat()
+                if contract.expiry_date:
+                    existing["expiry_date"] = contract.expiry_date.isoformat()
+                if contract.total_value is not None:
+                    existing["total_value"] = float(contract.total_value)
+                existing["metadata_verify_pass"] = True
+            except Exception as ve:
+                print(f"Metadata verify pass failed (non-fatal): {ve}")
+        still_missing = [f for f in REQUIRED_METADATA if getattr(contract, f) is None]
+        existing["needs_review"] = bool(still_missing)
+        if still_missing:
+            existing["needs_review_fields"] = still_missing
+        else:
+            existing.pop("needs_review_fields", None)
+
+        # Recompute the standardized filename from the party + date we now actually know. The
+        # regex pass at upload usually can't identify the company (which is why names showed
+        # "unknown-company" with the upload date); the LLM can, so fix the name here. Prefer the
+        # counterparty (the supplier — the useful identifier), then the company. Use the real
+        # effective date; fall back to the original uploaded filename when no party is found.
+        try:
+            party = (contract.counterparty or contract.company or "").strip()
+            if party:
+                from .parser import standardized_filename as _std_name
+                date_str = contract.effective_date.isoformat() if contract.effective_date else existing.get("contract_date")
+                base_date = contract.created_at.date().isoformat() if getattr(contract, "created_at", None) else datetime.now(timezone.utc).date().isoformat()
+                existing["display_name_source"] = "counterparty" if contract.counterparty else "company"
+                contract.filename = _std_name(
+                    {"company": party, "contract_type": contract.contract_type, "contract_date": date_str},
+                    base_date,
+                )
+            elif existing.get("original_filename"):
+                contract.filename = existing["original_filename"]
+        except Exception as fe:
+            print(f"Filename standardization failed (non-fatal): {fe}")
+
         contract.metadata_json = dict(existing)
     except Exception as me:
         print(f"Metadata extraction failed (non-fatal): {me}")
@@ -1191,7 +1345,10 @@ async def analyze_contract_background(contract_id: str, raw_text: str):
                 
                 # Check for parent and run redline verification
                 await _verify_contract_redlines(db, contract, contract_id, analysis_meta)
-                
+
+                # Clause-level "what changed vs previous version" diff (Changes tab)
+                await _compute_version_changes(db, contract, contract_id)
+
                 # Run obligation extraction
                 await _extract_and_save_obligations(contract, raw_text)
 
@@ -1210,6 +1367,10 @@ async def analyze_contract_background(contract_id: str, raw_text: str):
                 contract.metadata_json = {**existing, **analysis_meta}
                 log_contract_event(db, contract_id, "analysis", "Analysis completed", analysis_meta)
                 db.commit()
+
+                # Multi-turn deviation (Mode 1): re-measure this round vs the parent's
+                # template so the trend is comparable. Runs after the COMPLETED commit.
+                await _maybe_enqueue_round_deviation(db, contract, contract_id)
             print(f"Background task complete. Saved {len(analysis_results)} clauses.")
         finally:
             db.close()
@@ -1320,10 +1481,17 @@ async def upload_contract(
     # 2. Extract Text and Hash
     file_hash, raw_text = await extract_text_from_pdf(file_bytes)
     meta = extract_contract_metadata(raw_text)
+    meta["original_filename"] = file.filename or ""
     from datetime import datetime
     upload_date = datetime.utcnow().date().isoformat()
     std_name = standardized_filename(meta, upload_date)
-    
+    # The synchronous regex pass usually can't identify the company; rather than show an
+    # "unknown-company" placeholder while the LLM runs, keep the real uploaded filename. The
+    # background pipeline (_extract_and_save_metadata) recomputes the standardized name once the
+    # actual party + dates are known.
+    if not (meta.get("company") or "").strip() and (file.filename or "").strip():
+        std_name = file.filename
+
     # Check if exists (specifically owned by current_user)
     existing_contract = None
     if not parent_id:
@@ -1334,6 +1502,7 @@ async def upload_contract(
         existing = existing_contract.metadata_json or {}
         existing_contract.filename = std_name
         existing_contract.metadata_json = {**existing, "raw_text": raw_text, **meta}
+        _store_original_file(db, existing_contract.id, file_bytes, file.content_type, file.filename)
         if existing_contract.status == ContractStatus.FAILED:
             # Retry processing for failed contracts
             existing_contract.status = ContractStatus.PROCESSING
@@ -1390,6 +1559,7 @@ async def upload_contract(
     )
     db.add(new_contract)
     db.flush()
+    _store_original_file(db, new_contract.id, file_bytes, file.content_type, file.filename)
     log_contract_event(db, str(new_contract.id), "ingest", "PDF uploaded for analysis", {"cache": "miss", "mode": "pdf"})
     if parent_contract is not None and v_party == "counterparty":
         log_transition(db, new_contract, "SENT_TO_SUPPLIER", "NEGOTIATION",
@@ -1719,6 +1889,20 @@ async def list_contracts(
             "created_at": c.created_at.isoformat()
         })
 
+    # Repository at-a-glance chips: pending-approval count per contract (one batched query,
+    # no N+1). Stage + off-standard already ride along in the columns / metadata_json.
+    from .models import Approval
+    from sqlalchemy import func as _sqlfunc
+    full_ids = [c.id for c in contracts if can_read_full(current_user, c)]
+    pending_map = {}
+    if full_ids:
+        for cid, cnt in (db.query(Approval.contract_id, _sqlfunc.count(Approval.id))
+                         .filter(Approval.contract_id.in_(full_ids), Approval.status == "PENDING")
+                         .group_by(Approval.contract_id).all()):
+            pending_map[str(cid)] = cnt
+    for r in result:
+        r["pending_approvals"] = pending_map.get(r["id"], 0)
+
     return {"contracts": result, "total": total}
 
 
@@ -1906,6 +2090,9 @@ async def get_contract(
     elif risk_counts.get("MEDIUM", 0) > 0:
         overall_risk = "MEDIUM"
 
+    from .models import ContractFile
+    has_file = db.query(ContractFile.id).filter(ContractFile.contract_id == contract.id).first() is not None
+
     return {
         "contract": {
             "id": str(contract.id),
@@ -1916,9 +2103,37 @@ async def get_contract(
             "party": contract.party,
             "round": contract.round,
             "overall_risk": overall_risk if contract.status == ContractStatus.COMPLETED else None,
+            "has_original_file": has_file,
             "created_at": contract.created_at.isoformat()
         }
     }
+
+
+@app.get("/api/v1/contracts/{contract_id}/file")
+async def get_contract_file(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Serve the original uploaded document (PDF) so the cockpit can show the real document, not
+    just the extracted OCR text. 404 when no original was stored (older contracts / pasted text)."""
+    contract = get_accessible_contract(db, contract_id, current_user)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    from .models import ContractFile
+    f = (db.query(ContractFile)
+         .filter(ContractFile.contract_id == contract.id)
+         .order_by(ContractFile.created_at.desc())
+         .first())
+    if not f or not f.content:
+        raise HTTPException(status_code=404, detail="No original file stored for this contract")
+    from fastapi.responses import Response
+    safe_name = (f.filename or "document.pdf").replace('"', '').replace("\n", " ")
+    return Response(
+        content=bytes(f.content),
+        media_type=f.mime or "application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2485,6 +2700,11 @@ async def clause_repository_search(
 # Global assistant chat (bottom-left assistant)
 # ---------------------------------------------------------------------------
 
+# When a contract is open, feed the assistant the whole document up to this many characters
+# (~30K tokens) so it can answer any question about it. Gemini's context easily holds it.
+ASSIST_CTX_FULLTEXT_CAP = 120_000
+
+
 class AssistantContextIn(BaseModel):
     contract_id: str | None = None
     contract_name: str | None = None
@@ -2613,15 +2833,30 @@ async def assistant_chat(
         .all()
     )
 
+    # The contract the user is viewing gets its FULL text (not just top-k snippets), so the chat
+    # can answer ANY question about it and reads the same document the panel shows. Portfolio
+    # clauses stay retrieval-based (for cross-contract comparison).
+    ctx_full_text = ""
+    if ctx_contract is not None:
+        ctx_full_text = ((ctx_contract.metadata_json or {}).get("raw_text") or "").strip()
+
     context_parts = []
     sources = []
-    for i, (clause, contract) in enumerate(matches):
+    if ctx_contract is not None and ctx_full_text:
+        doc = ctx_full_text if len(ctx_full_text) <= ASSIST_CTX_FULLTEXT_CAP else (ctx_full_text[:ASSIST_CTX_FULLTEXT_CAP] + "\n…[document truncated for length]…")
+        context_parts.append(f"=== CURRENT CONTRACT — FULL TEXT ({ctx_contract.filename}) ===\n{doc}")
+
+    portfolio_header_added = False
+    for clause, contract in matches:
         risk = clause.risk_level.value if clause.risk_level else "LOW"
-        if ctx_contract is not None and i == 0:
-            context_parts.append(f"=== CURRENT CONTRACT ({ctx_contract.filename}) ===")
-        if ctx_contract is not None and i == ctx_match_count and ctx_match_count > 0:
-            context_parts.append("=== OTHER CONTRACTS IN PORTFOLIO ===")
-        context_parts.append(f"[{contract.filename} :: {clause.clause_type} | Risk: {risk}]\n{(clause.text_content or '')[:900]}")
+        is_ctx = ctx_contract is not None and str(contract.id) == str(ctx_contract.id)
+        # When the full current-contract text is already supplied, don't re-append its clauses to
+        # the prompt; still record them as sources (citation chips / deep-links).
+        if not (is_ctx and ctx_full_text):
+            if ctx_contract is not None and not is_ctx and not portfolio_header_added:
+                context_parts.append("=== OTHER CONTRACTS IN PORTFOLIO (for comparison) ===")
+                portfolio_header_added = True
+            context_parts.append(f"[{contract.filename} :: {clause.clause_type} | Risk: {risk}]\n{(clause.text_content or '')[:900]}")
         sources.append(
             {
                 "contract_id": str(contract.id),
@@ -2636,13 +2871,16 @@ async def assistant_chat(
 
     system_prompt = (
         "You are Jaggaer Assist, the ContractsPulse copilot for procurement managers. "
-        "You help answer questions and find relevant clause examples across the user's contracts. "
-        "Use ONLY the provided clause excerpts. If you lack context, ask a follow-up question or say you can't confirm. "
-        "When you cite a clause, mention the contract filename. "
+        "You answer questions and find relevant clause examples across the user's contracts. "
+        + ("A section titled 'CURRENT CONTRACT — FULL TEXT' contains the COMPLETE text of the contract "
+           "the user is viewing — answer any question about the current contract directly from it and "
+           "quote the relevant language. Treat 'OTHER CONTRACTS IN PORTFOLIO' excerpts as comparison "
+           "material only. " if ctx_contract is not None and ctx_full_text else "")
+        + "Use ONLY the provided text. If the provided text genuinely does not address the question, say so plainly. "
+        "When you cite, mention the contract filename. "
         "If the user asks to FIND or FILTER contracts by attributes (type, vendor, dates, value, "
         "renewal, business unit), call the search_contracts tool instead of answering from excerpts."
-        + (f" The user is currently viewing contract '{ctx_contract.filename}'. Prefer it when answering; "
-           "cite other contracts only for comparison." if ctx_contract is not None else "")
+        + (f" The user is currently viewing contract '{ctx_contract.filename}'." if ctx_contract is not None else "")
         + FOLLOWUP_INSTRUCTION
     )
 
@@ -2723,10 +2961,20 @@ async def assistant_chat(
         name = contract.filename or "contract"
         short = name if len(name) <= 30 else name[:30] + "…"
         actions.append({"type": "open_contract", "label": f"Open {short}", "contract_id": cid})
+        if (contract.metadata_json or {}).get("version_changes", {}).get("available"):
+            actions.append({"type": "view_changes", "label": f"What changed — {short}", "contract_id": cid})
         if (contract.metadata_json or {}).get("deviation_analysis"):
             actions.append({"type": "view_deviations", "label": f"Deviations — {short}", "contract_id": cid})
         if len(seen_contracts) >= 3:
             break
+    if matches:
+        top_clause, top_contract = matches[0]
+        actions.append({
+            "type": "view_clause",
+            "label": f"Jump to clause — {top_clause.clause_type}",
+            "contract_id": str(top_contract.id),
+            "clause_type": top_clause.clause_type,
+        })
     redlined = next(((cl, co) for cl, co in matches if (cl.redline_suggestion or "").strip()), None)
     if redlined:
         actions.append({
@@ -2749,12 +2997,27 @@ async def assistant_chat(
     else:
         query_scope = "portfolio"
 
+    # Grounding check (T16): does the answer actually follow from the provided context? Include the
+    # current contract's full text so answers drawn from anywhere in the open document aren't
+    # falsely flagged (the retrieved `sources` are only a few clauses).
+    from .agents import check_grounding
+    grounding_sources = sources
+    if ctx_contract is not None and ctx_full_text:
+        grounding_sources = [{
+            "contract_name": ctx_contract.filename,
+            "clause_type": "current contract (full text)",
+            "text_excerpt": ctx_full_text[:ASSIST_CTX_FULLTEXT_CAP],
+        }] + sources
+    grounding = await check_grounding(answer, grounding_sources, use_llm=True)
+
     response_meta = {
         "sources": sources,
         "actions": actions,
         "suggested_questions": followups,
         "route": "rag",
         "query_scope": query_scope,
+        "grounded": grounding.get("grounded"),
+        "grounding_score": grounding.get("grounding_score"),
     }
     _persist_turn(db, convo, question, answer, response_meta)
     return {
@@ -3165,6 +3428,84 @@ async def get_contract_deviations(
         "matched_template_id": meta.get("matched_template_id"),
         "deviation_analysis": meta.get("deviation_analysis"),
     }
+
+
+@app.get("/api/v1/contracts/{contract_id}/changes")
+async def get_contract_changes(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Clause-level "what changed vs the previous version" diff (Changes tab, Assist
+    deep-links). Returns the persisted metadata_json.version_changes enriched with the
+    parent/child filenames. {available: false, reason} when there is no parent or the
+    parent was not analyzed. No recompute on read."""
+    contract = get_accessible_contract(db, contract_id, current_user)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    meta = contract.metadata_json or {}
+    changes = meta.get("version_changes")
+    parent_id = meta.get("parent_contract_id")
+    if not changes:
+        return {"available": False, "reason": "no_parent" if not parent_id else "not_computed"}
+    out = dict(changes)
+    out["contract_filename"] = contract.filename
+    out["version_number"] = out.get("version_number") or meta.get("version_number")
+    if parent_id:
+        parent = db.query(Contract).filter(Contract.id == parent_id).first()
+        if parent:
+            out["parent_filename"] = parent.filename
+    return out
+
+
+class DeviationDecisionIn(BaseModel):
+    decision: str  # ACCEPT | REJECT | NEEDS_CHANGES | ACCEPTED_FALLBACK
+    note: str | None = None
+    clause_type: str | None = None
+
+
+DEVIATION_DECISIONS = {"ACCEPT", "REJECT", "NEEDS_CHANGES", "ACCEPTED_FALLBACK"}
+
+
+@app.post("/api/v1/contracts/{contract_id}/deviations/{key}/decide")
+async def decide_deviation(
+    contract_id: str,
+    key: str,
+    payload: DeviationDecisionIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record a reviewer's accept/reject/needs-changes decision on a specific deviation or
+    changed clause (T14 — puts the human decision into the system of record). `key` is opaque
+    (a deviation item index like "dev:3" or a changed-clause id like "chg:<uuid>"). Stored in
+    metadata_json.deviation_decisions (a top-level dict so it survives deviation re-runs) and
+    mirrored to the ContractEvent audit feed with actor + timestamp."""
+    contract = get_accessible_contract(db, contract_id, current_user)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    decision = (payload.decision or "").upper()
+    if decision not in DEVIATION_DECISIONS:
+        raise HTTPException(status_code=400, detail=f"decision must be one of {sorted(DEVIATION_DECISIONS)}")
+    meta = dict(contract.metadata_json or {})
+    decisions = dict(meta.get("deviation_decisions") or {})
+    record = {
+        "decision": decision,
+        "note": (payload.note or "").strip(),
+        "clause_type": payload.clause_type,
+        "actor_user_id": str(current_user.id),
+        "actor_email": current_user.email,
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
+    decisions[key] = record
+    meta["deviation_decisions"] = decisions
+    contract.metadata_json = meta
+    log_contract_event(
+        db, contract_id, "deviation_decision",
+        f"{decision} on {payload.clause_type or key}",
+        {"key": key, "decision": decision, "clause_type": payload.clause_type},
+    )
+    db.commit()
+    return {"key": key, "decision": record}
 
 
 async def run_deviation_analysis_background(contract_id: str, template_id: str):
@@ -3654,6 +3995,45 @@ async def backfill_metadata(
         db.commit()
 
     return {"processed": processed, "failed": failed, "skipped": skipped, "total_candidates": len(rows)}
+
+
+@app.post("/api/v1/admin/backfill-filenames")
+async def backfill_filenames(
+    all_names: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Recompute standardized filenames from already-extracted metadata — no LLM, instant. By
+    default only fixes names still stuck on the "unknown-company" placeholder (the bug where the
+    name was built from the weak regex pass before the LLM identified the party); pass
+    all_names=true to restandardize all of the caller's contracts. Prefers the counterparty
+    (supplier) then the company, and uses the real effective date. Falls back to the original
+    uploaded filename when no party was identified. Curated names without the placeholder are
+    left untouched by default."""
+    from .parser import standardized_filename as _std_name
+    rows = db.query(Contract).filter(Contract.user_id == current_user.id).all()
+    renamed, skipped = 0, 0
+    for contract in rows:
+        if not all_names and "unknown-company" not in (contract.filename or ""):
+            skipped += 1
+            continue
+        meta = contract.metadata_json or {}
+        party = (contract.counterparty or contract.company or "").strip()
+        if party:
+            date_str = contract.effective_date.isoformat() if contract.effective_date else meta.get("contract_date")
+            base_date = contract.created_at.date().isoformat() if contract.created_at else datetime.now(timezone.utc).date().isoformat()
+            contract.filename = _std_name(
+                {"company": party, "contract_type": contract.contract_type, "contract_date": date_str},
+                base_date,
+            )
+            renamed += 1
+        elif meta.get("original_filename"):
+            contract.filename = meta["original_filename"]
+            renamed += 1
+        else:
+            skipped += 1
+        db.commit()
+    return {"renamed": renamed, "skipped": skipped, "total": len(rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -4289,10 +4669,15 @@ async def get_lineage(
 
     versions = []
     for c in chain:
-        resolutions = (c.metadata_json or {}).get("redline_resolutions") or []
+        cmeta = c.metadata_json or {}
+        resolutions = cmeta.get("redline_resolutions") or []
+        dev_summary = ((cmeta.get("deviation_analysis") or {}).get("summary")) or {}
+        vc = cmeta.get("version_changes") or {}
+        vc_summary = vc.get("summary") or {}
+        vc_available = bool(vc.get("available"))
         versions.append({
             "id": str(c.id),
-            "version_number": (c.metadata_json or {}).get("version_number", 1),
+            "version_number": cmeta.get("version_number", 1),
             "party": c.party or "internal",
             "round": c.round or 0,
             "filename": c.filename,
@@ -4301,6 +4686,12 @@ async def get_lineage(
             "created_at": c.created_at.isoformat() if c.created_at else None,
             "changed_clauses": len(resolutions),
             "resolved_clauses": sum(1 for r in resolutions if r.get("status") == "RESOLVED"),
+            # Multi-turn deviation trend (Mode 1) + real change count (Mode 2).
+            "off_standard": dev_summary.get("off_playbook"),
+            "deviation_status": cmeta.get("deviation_status"),
+            "version_changed_clauses": (
+                vc_summary.get("modified", 0) + vc_summary.get("added", 0) + vc_summary.get("removed", 0)
+            ) if vc_available else None,
             "is_current": str(c.id) == str(contract.id),
         })
     return {"versions": versions, "thread_length": len(versions)}

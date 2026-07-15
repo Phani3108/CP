@@ -81,6 +81,10 @@
 			case 'view_deviations':
 				if (a.contract_id) goto(`/contracts/${a.contract_id}?tab=deviation`);
 				break;
+			case 'view_changes':
+				if (a.contract_id)
+					goto(`/contracts/${a.contract_id}?tab=changes${a.clause_type ? `&section=whatchanged` : ''}`);
+				break;
 			case 'copy_redline':
 				if (a.text) {
 					try {
@@ -151,6 +155,16 @@
 							<button type="button" class="btn btn-secondary resend-btn" onclick={() => assist.resend()}>Resend message</button>
 						{:else if m.role === 'assistant'}
 							<div class="chat-markdown">{@html renderMarkdown(m.content)}</div>
+							{#if m.meta?.grounded != null || m.meta?.grounding_score != null}
+								<div class="grounding-row">
+									{#if m.meta.grounded}
+										<span class="grounding-badge grounded" title="This answer is supported by the cited clauses">✓ Grounded{#if m.meta.grounding_score != null} · {Math.round(m.meta.grounding_score * 100)}%{/if}</span>
+									{:else}
+										<span class="grounding-badge verify" title="Some of this answer may not be fully supported by the cited clauses — check before relying on it">⚠ Verify{#if m.meta.grounding_score != null} · {Math.round(m.meta.grounding_score * 100)}%{/if}</span>
+									{/if}
+									<span class="grounding-caption">AI-generated — verify before sending</span>
+								</div>
+							{/if}
 							{#if m.results && m.results.length > 0}
 								<div class="results-table-wrap">
 									<table class="results-table">
@@ -467,6 +481,31 @@
 	}
 
 	/* Meta footer: route chips + sources */
+	.grounding-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin-top: 8px;
+		flex-wrap: wrap;
+	}
+	.grounding-badge {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 2px 9px;
+		border-radius: 999px;
+	}
+	.grounding-badge.grounded {
+		color: var(--color-low-text, #15803d);
+		background: color-mix(in srgb, var(--color-low, #22c55e) 16%, transparent);
+	}
+	.grounding-badge.verify {
+		color: var(--color-high-text, #b45309);
+		background: color-mix(in srgb, var(--color-medium, #f59e0b) 20%, transparent);
+	}
+	.grounding-caption {
+		font-size: 10px;
+		color: var(--text-tertiary, #999);
+	}
 	.meta-footer {
 		border-top: 1px solid #f0f0f2;
 		margin: 12px -18px -12px;

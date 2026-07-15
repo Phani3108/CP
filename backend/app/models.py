@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Date, ForeignKey, Text, Enum, Boolean, Integer, Numeric, Float
+from sqlalchemy import Column, String, DateTime, Date, ForeignKey, Text, Enum, Boolean, Integer, Numeric, Float, LargeBinary
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from pgvector.sqlalchemy import Vector
@@ -91,6 +91,21 @@ class Contract(Base):
     # Relationships
     clauses = relationship("ContractClause", back_populates="contract", cascade="all, delete-orphan")
     user = relationship("User", back_populates="contracts")
+
+
+class ContractFile(Base):
+    """The original uploaded document bytes (PDF/DOCX), kept so the cockpit can show the real
+    document, not just the extracted OCR text. Separate table so the heavy blob stays out of the
+    frequently-queried contracts row."""
+    __tablename__ = "contract_files"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    contract_id = Column(UUID(as_uuid=True), ForeignKey("contracts.id", ondelete="CASCADE"), index=True, nullable=False)
+    content = Column(LargeBinary, nullable=False)
+    mime = Column(String, nullable=True)
+    filename = Column(String, nullable=True)
+    size = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ContractClause(Base):

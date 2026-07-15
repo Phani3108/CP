@@ -1,14 +1,15 @@
 """Unit tests for the symmetric clause aligner (app.deviation)."""
 import math
 
-from app.deviation import align_clauses, get_thresholds
+from app.deviation import align_clauses, build_version_diff, get_thresholds, word_diff
 
 
 class FakeClause:
-    def __init__(self, clause_type, embedding):
+    def __init__(self, clause_type, embedding, text=None, id=None):
         self.clause_type = clause_type
         self.embedding = embedding
-        self.text_content = clause_type
+        self.text_content = text if text is not None else clause_type
+        self.id = id
 
 
 def unit(v):
@@ -100,3 +101,83 @@ def test_type_mismatch_tolerated_above_trust():
 def test_env_thresholds_parse():
     high, low = get_thresholds()
     assert 0 < low < high <= 1
+
+
+# --- word_diff ---------------------------------------------------------------
+
+def _join(ops, op):
+    return "".join(o["text"] for o in ops if o["op"] == op)
+
+
+def test_word_diff_equal_only():
+    ops = word_diff("the cap is 12 months", "the cap is 12 months")
+    assert all(o["op"] == "equal" for o in ops)
+    assert _join(ops, "equal") == "the cap is 12 months"
+
+
+def test_word_diff_replace_surfaces_delete_and_insert():
+    ops = word_diff("liability capped at 12 months", "liability capped at 24 months")
+    # "12" deleted, "24" inserted; the rest stays equal and losslessly re-joins.
+    assert _join(ops, "delete") == "12"
+    assert _join(ops, "insert") == "24"
+    old = "".join(o["text"] for o in ops if o["op"] in ("equal", "delete"))
+    new = "".join(o["text"] for o in ops if o["op"] in ("equal", "insert"))
+    assert old == "liability capped at 12 months"
+    assert new == "liability capped at 24 months"
+
+
+def test_word_diff_pure_insert_and_delete():
+    assert _join(word_diff("", "brand new clause"), "insert") == "brand new clause"
+    assert _join(word_diff("was here", ""), "delete") == "was here"
+
+
+def test_word_diff_long_input_degrades():
+    old = "a " * 5000
+    new = "b " * 5000
+    ops = word_diff(old, new, max_chars=100)
+    assert [o["op"] for o in ops] == ["delete", "insert"]
+
+
+# --- build_version_diff ------------------------------------------------------
+
+def test_build_version_diff_guards_unanalyzed_parent():
+    prev = [FakeClause("Termination", None, text="x")]
+    new = [FakeClause("Termination", TERMINATION, text="y")]
+    res = build_version_diff(prev, new, sim_high=0.92, sim_low=0.62)
+    assert res == {"available": False, "reason": "parent_not_analyzed"}
+
+
+def test_build_version_diff_classifies_all_change_types():
+    prev = [
+        FakeClause("Termination", TERMINATION, text="Either party may terminate on 30 days notice.", id="p1"),
+        FakeClause("Limitation of Liability", LIABILITY, text="Liability capped at fees paid.", id="p2"),
+        FakeClause("Confidentiality", TERMINATION_TWEAKED, text="Keep it secret.", id="p3"),
+    ]
+    new = [
+        # Same topic axis as p1 but rewritten text → MODIFIED (word_diff finds edits)
+        FakeClause("Termination", TERMINATION, text="Either party may terminate on 60 days notice.", id="n1"),
+        # p2 Liability has no counterpart → REMOVED
+        # p3 Confidentiality nearly identical embedding + identical text → UNCHANGED
+        FakeClause("Confidentiality", TERMINATION_TWEAKED, text="Keep it secret.", id="n3"),
+        # Brand-new clause → ADDED
+        FakeClause("Payment Terms", BRAND_NEW, text="Net 45 payment.", id="n4"),
+    ]
+    res = build_version_diff(prev, new, sim_high=0.92, sim_low=0.62)
+    assert res["available"] is True
+    assert res["summary"] == {"added": 1, "removed": 1, "modified": 1, "unchanged": 1}
+
+    by_type = {c["change_type"]: c for c in res["clauses"]}
+    # MODIFIED carries a word diff and the cross-version identity edge.
+    mod = by_type["MODIFIED"]
+    assert mod["prev_clause_id"] == "p1" and mod["new_clause_id"] == "n1"
+    assert any(o["op"] == "delete" for o in mod["word_diff"])
+    assert any(o["op"] == "insert" for o in mod["word_diff"])
+    # REMOVED / ADDED carry the right single-sided ids.
+    assert by_type["REMOVED"]["prev_clause_id"] == "p2"
+    assert by_type["REMOVED"]["new_clause_id"] is None
+    assert by_type["ADDED"]["new_clause_id"] == "n4"
+    assert by_type["ADDED"]["prev_clause_id"] is None
+    # UNCHANGED has no word diff.
+    assert by_type["UNCHANGED"]["word_diff"] is None
+    # Changes sort ahead of unchanged.
+    assert res["clauses"][-1]["change_type"] == "UNCHANGED"

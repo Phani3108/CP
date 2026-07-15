@@ -11,7 +11,9 @@ one-to-one alignment and classify every clause on BOTH sides:
 
 Pure functions, no DB or LLM access — unit-testable with synthetic vectors.
 """
+import difflib
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -196,3 +198,165 @@ def align_clauses(
     result.deleted = [t for k, (_, t) in enumerate(t_items) if k not in t_taken]
     result.added = [c for k, (_, c) in enumerate(c_items) if k not in c_taken]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Cross-version "what changed" diff — reuses align_clauses on two contract
+# versions (previous vs new) and adds a word-level inline redline per modified
+# clause. Pure/deterministic, no LLM — the basis of the Changes tab and
+# multi-turn (version-vs-version) deviation.
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    # Whitespace and punctuation are their own tokens so a re-join is lossless.
+    return _TOKEN_RE.findall(text or "")
+
+
+def word_diff(old_text: str, new_text: str, max_chars: int = 8000) -> list[dict]:
+    """Word-level inline diff between two clause texts.
+
+    Returns a flat op list ``[{"op": "equal"|"insert"|"delete", "text": str}]``
+    the frontend renders as ``<span>/<ins>/<del>`` (escaped elements, never
+    ``{@html}``). For very long inputs it degrades to a single delete+insert to
+    bound cost. Deterministic, no LLM.
+    """
+    old_text = old_text or ""
+    new_text = new_text or ""
+    if len(old_text) > max_chars or len(new_text) > max_chars:
+        ops: list[dict] = []
+        if old_text:
+            ops.append({"op": "delete", "text": old_text})
+        if new_text:
+            ops.append({"op": "insert", "text": new_text})
+        return ops
+
+    old_tokens = _tokenize(old_text)
+    new_tokens = _tokenize(new_text)
+    sm = difflib.SequenceMatcher(a=old_tokens, b=new_tokens, autojunk=False)
+
+    ops = []
+
+    def _emit(op: str, text: str) -> None:
+        if not text:
+            return
+        if ops and ops[-1]["op"] == op:
+            ops[-1]["text"] += text
+        else:
+            ops.append({"op": op, "text": text})
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            _emit("equal", "".join(old_tokens[i1:i2]))
+        elif tag == "delete":
+            _emit("delete", "".join(old_tokens[i1:i2]))
+        elif tag == "insert":
+            _emit("insert", "".join(new_tokens[j1:j2]))
+        elif tag == "replace":
+            _emit("delete", "".join(old_tokens[i1:i2]))
+            _emit("insert", "".join(new_tokens[j1:j2]))
+    return ops
+
+
+def _clause_text(c: Any) -> str:
+    return getattr(c, "text_content", None) or ""
+
+
+def _clause_id(c: Any) -> Any:
+    cid = getattr(c, "id", None)
+    return str(cid) if cid is not None else None
+
+
+# Changes-first ordering so the useful rows sit on top of the Changes tab.
+_CHANGE_ORDER = {"MODIFIED": 0, "ADDED": 1, "REMOVED": 2, "UNCHANGED": 3}
+
+
+def build_version_diff(
+    prev_clauses: list[Any],
+    new_clauses: list[Any],
+    sim_high: float | None = None,
+    sim_low: float | None = None,
+) -> dict:
+    """Clause-level diff between a previous contract version and the new one.
+
+    Clause objects need ``.embedding``, ``.clause_type``, ``.text_content`` and
+    ``.id``. Reuses :func:`align_clauses`; matched+modified pairs are re-judged by
+    :func:`word_diff` so a >0.92-similar pair with a small edit still surfaces as
+    a real redline.
+
+    Guards: if the previous side has no embedded clauses, returns
+    ``{"available": False, "reason": "parent_not_analyzed"}`` — otherwise the
+    aligner would report every new clause as ADDED. Same for an unanalyzed new
+    side.
+    """
+    if not prev_clauses or all(getattr(c, "embedding", None) is None for c in prev_clauses):
+        return {"available": False, "reason": "parent_not_analyzed"}
+    if not new_clauses or all(getattr(c, "embedding", None) is None for c in new_clauses):
+        return {"available": False, "reason": "contract_not_analyzed"}
+
+    result = align_clauses(prev_clauses, new_clauses, sim_high=sim_high, sim_low=sim_low)
+
+    clauses: list[dict] = []
+    modified = 0
+    unchanged = 0
+
+    for pair in list(result.matched) + list(result.modified):
+        prev_c = pair.template_clause
+        new_c = pair.contract_clause
+        prev_text = _clause_text(prev_c)
+        new_text = _clause_text(new_c)
+        wd = word_diff(prev_text, new_text)
+        changed = any(op["op"] != "equal" for op in wd)
+        clauses.append({
+            "change_type": "MODIFIED" if changed else "UNCHANGED",
+            "clause_type": getattr(new_c, "clause_type", None) or getattr(prev_c, "clause_type", None),
+            "prev_clause_id": _clause_id(prev_c),
+            "new_clause_id": _clause_id(new_c),
+            "alignment_score": pair.score,
+            "prev_text": prev_text,
+            "new_text": new_text,
+            "word_diff": wd if changed else None,
+        })
+        if changed:
+            modified += 1
+        else:
+            unchanged += 1
+
+    for t in result.deleted:
+        clauses.append({
+            "change_type": "REMOVED",
+            "clause_type": getattr(t, "clause_type", None),
+            "prev_clause_id": _clause_id(t),
+            "new_clause_id": None,
+            "alignment_score": None,
+            "prev_text": _clause_text(t),
+            "new_text": None,
+            "word_diff": None,
+        })
+
+    for c in result.added:
+        clauses.append({
+            "change_type": "ADDED",
+            "clause_type": getattr(c, "clause_type", None),
+            "prev_clause_id": None,
+            "new_clause_id": _clause_id(c),
+            "alignment_score": None,
+            "prev_text": None,
+            "new_text": _clause_text(c),
+            "word_diff": None,
+        })
+
+    clauses.sort(key=lambda r: _CHANGE_ORDER.get(r["change_type"], 9))
+
+    return {
+        "available": True,
+        "summary": {
+            "added": len(result.added),
+            "removed": len(result.deleted),
+            "modified": modified,
+            "unchanged": unchanged,
+        },
+        "clauses": clauses,
+    }

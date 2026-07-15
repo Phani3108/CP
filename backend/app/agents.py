@@ -97,6 +97,66 @@ redline_verifier_agent = Agent(
     )
 )
 
+# Grounding checker: does the assistant's answer actually follow from the cited excerpts?
+# (T16 — explainable AI. A single pass over the already-retrieved excerpts, not a per-claim
+# fan-out, with a heuristic token-overlap fallback so a model outage degrades gracefully.)
+class GroundingCheck(BaseModel):
+    grounding_score: float = Field(ge=0.0, le=1.0, description="Fraction (0..1) of the answer's factual claims directly supported by the provided source excerpts. Conversational framing does not count against it.")
+    grounded: bool = Field(description="True if the answer is well-supported by the sources with no material unsupported claim.")
+    unsupported: str = Field(default="", description="Brief note of any claim NOT supported by the sources; empty if all supported.")
+
+grounding_checker_agent = Agent(
+    os.getenv("OPENAI_MODEL_ASSISTANT", os.getenv("OPENAI_MODEL_RISK", "openai:gpt-4.1")),
+    output_type=GroundingCheck,
+    retries=2,
+    system_prompt=(
+        "You are a citation-grounding checker. You receive an AI assistant's ANSWER and the SOURCE "
+        "excerpts it was supposed to rely on. Judge how well the answer is supported by ONLY those "
+        "excerpts, using no outside knowledge. Score grounding_score as the fraction of the answer's "
+        "factual claims that are directly supported by the excerpts (general conversational framing, "
+        "hedges, and follow-up questions do not count against it). Set grounded=false only if the "
+        "answer makes a material factual claim the excerpts do not support. Be strict but fair."
+    )
+)
+
+
+def _heuristic_grounding(answer: str, sources: list[dict]) -> dict:
+    """Token-overlap fallback: fraction of the answer's significant words present in the cited
+    excerpts. Answers paraphrase, so the ratio is scaled up modestly."""
+    ans_words = {w for w in re.findall(r"[a-z]{4,}", (answer or "").lower())}
+    if not ans_words:
+        return {"grounding_score": None, "grounded": None, "method": "heuristic"}
+    src_text = " ".join((s.get("text_excerpt") or "") for s in (sources or [])).lower()
+    src_words = set(re.findall(r"[a-z]{4,}", src_text))
+    overlap = len(ans_words & src_words) / max(len(ans_words), 1)
+    score = round(min(1.0, overlap * 1.6), 2)
+    return {"grounding_score": score, "grounded": score >= 0.4, "method": "heuristic"}
+
+
+async def check_grounding(answer: str, sources: list[dict], use_llm: bool = True) -> dict:
+    """Return {grounding_score: 0..1|None, grounded: bool|None, method}. `sources` are the
+    retrieved clause excerpts with a `text_excerpt` field."""
+    if not answer or not sources:
+        return {"grounding_score": None, "grounded": None, "method": "none"}
+    if use_llm:
+        try:
+            excerpts = "\n\n".join(
+                f"[{i + 1}] {s.get('contract_name', '')} · {s.get('clause_type', '')}: {s.get('text_excerpt', '')}"
+                for i, s in enumerate(sources)
+            )
+            run = await grounding_checker_agent.run(f"ANSWER:\n{answer}\n\nSOURCE EXCERPTS:\n{excerpts}")
+            out = run.output
+            return {
+                "grounding_score": round(float(out.grounding_score), 2),
+                "grounded": bool(out.grounded),
+                "unsupported": out.unsupported,
+                "method": "llm",
+            }
+        except Exception as e:
+            print(f"Grounding check failed, using heuristic: {e}")
+    return _heuristic_grounding(answer, sources)
+
+
 # Agent 4: The Obligation Extractor
 # Extracts actionable procurement obligations from the full contract text.
 class ObligationItem(BaseModel):

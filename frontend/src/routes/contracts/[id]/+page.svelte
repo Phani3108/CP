@@ -6,6 +6,8 @@
 	import { toast } from '$lib/toastStore';
 	import { assist } from '$lib/assist.svelte';
 	import { authState } from '$lib/auth.svelte';
+	import ClampText from '$lib/ClampText.svelte';
+	import WordDiff from '$lib/WordDiff.svelte';
 
 	type ContractDetail = {
 		id: string;
@@ -13,6 +15,8 @@
 		status: string;
 		metadata_json?: any;
 		overall_risk?: string | null;
+		has_original_file?: boolean;
+		lifecycle_stage?: string | null;
 		created_at: string;
 	};
 
@@ -52,7 +56,54 @@
 
 	// Tabs state
 	let activeTab = $state('overview'); // 'overview' | 'risks' | 'clauses' | 'obligations' | 'verification' | 'deviation' | 'workflow' | 'history' | 'trace'
-	const VALID_TABS = ['overview', 'risks', 'clauses', 'obligations', 'verification', 'deviation', 'workflow', 'history', 'trace'];
+	const VALID_TABS = ['overview', 'risks', 'clauses', 'obligations', 'changes', 'deviation', 'workflow', 'history', 'trace'];
+	let tabBarEl = $state<HTMLElement | null>(null);
+	let riskLegendOpen = $state(false);
+
+	// Document panel: show the real uploaded PDF ("Original") vs the annotated OCR text ("Text").
+	type DocView = 'original' | 'text';
+	let docView = $state<DocView>('text');
+	let docViewInit = false;
+	let originalUrl = $state<string | null>(null);
+	let originalLoading = $state(false);
+	let originalError = $state(false);
+	const hasOriginalFile = $derived(!!contract?.has_original_file);
+
+	async function loadOriginalFile() {
+		if (originalUrl || originalLoading || !contractId) return;
+		originalLoading = true;
+		originalError = false;
+		try {
+			const res = await apiFetch(`/api/v1/contracts/${contractId}/file`);
+			if (!res.ok) throw new Error('no original file');
+			originalUrl = URL.createObjectURL(await res.blob());
+		} catch {
+			originalError = true;
+		} finally {
+			originalLoading = false;
+		}
+	}
+
+	// Fetch the PDF lazily when the Original view is active.
+	$effect(() => {
+		if (docView === 'original' && hasOriginalFile && !originalUrl && !originalLoading && !originalError) {
+			loadOriginalFile();
+		}
+	});
+
+	// Revoke the blob URL and reset when navigating to another contract (the component is reused
+	// across [id] param changes) and on destroy.
+	$effect(() => {
+		const _id = contractId;
+		return () => {
+			if (originalUrl) URL.revokeObjectURL(originalUrl);
+			originalUrl = null;
+			originalError = false;
+			docViewInit = false;
+		};
+	});
+	// Unified "Changes" tab sub-section: what changed vs previous version | redline resolution | trend
+	let changesSection = $state<'whatchanged' | 'redlines' | 'trend'>('whatchanged');
 
 	// Obligations state
 	type ObligationItem = {
@@ -435,6 +486,12 @@
 				const data = await res.json();
 				contract = data.contract;
 
+				// Default to the original document when we have it; else the annotated text.
+				if (contract && !docViewInit) {
+					docViewInit = true;
+					docView = contract.has_original_file ? 'original' : 'text';
+				}
+
 				if (contract) {
 					if (contract.status === 'PROCESSING') {
 						fetchContractStatus();
@@ -446,8 +503,13 @@
 						processingStatus = null;
 					}
 					// Auto-select 'verification' tab if there are redline resolutions and it's a version and no tab has been selected yet.
-					if (contract.metadata_json?.parent_contract_id && contract.metadata_json?.redline_resolutions?.length > 0 && activeTab === 'overview' && !new URL(window.location.href).searchParams.get('tab')) {
-						activeTab = 'verification';
+					if (contract.metadata_json?.parent_contract_id && activeTab === 'overview' && !new URL(window.location.href).searchParams.get('tab')) {
+						const hasChanges = contract.metadata_json?.version_changes?.available;
+						const hasRedlines = contract.metadata_json?.redline_resolutions?.length > 0;
+						if (hasChanges || hasRedlines) {
+							activeTab = 'changes';
+							changesSection = hasChanges ? 'whatchanged' : 'redlines';
+						}
 					}
 				}
 			} else if (res.status === 404) {
@@ -852,6 +914,101 @@
 	let selectedTemplateId = $state('');
 	let deviationStarting = $state(false);
 	const deviationData = $derived(contract?.metadata_json?.deviation_analysis || null);
+
+	// Changes tab (Slice 3): clause-level "what changed vs previous version" (from the pipeline)
+	// and the redline-resolution audit. Both live in metadata_json, so no extra fetch is needed.
+	const versionChanges = $derived(contract?.metadata_json?.version_changes || null);
+	const hasParentVersion = $derived(!!contract?.metadata_json?.parent_contract_id);
+	const changeCount = $derived.by(() => {
+		const s = versionChanges?.available ? versionChanges.summary : null;
+		return s ? (s.modified || 0) + (s.added || 0) + (s.removed || 0) : 0;
+	});
+
+	// Per-deviation reviewer decisions (T14/H2) — a human accept/reject on each deviation or
+	// changed clause, captured in the system of record.
+	const deviationDecisions = $derived((contract?.metadata_json?.deviation_decisions || {}) as Record<string, any>);
+	let decisionBusy = $state<string | null>(null);
+	function decisionLabel(d: string): string {
+		return ({ ACCEPT: 'Accepted', REJECT: 'Rejected', NEEDS_CHANGES: 'Needs changes', ACCEPTED_FALLBACK: 'Using our language' } as Record<string, string>)[d] || d;
+	}
+	// H5: surface our approved fallback language wherever a deviation shows up — including
+	// What-Changed modified clauses — so the tool resolves, not just diagnoses.
+	function standardLanguageFor(clauseType: string | null | undefined): string | null {
+		if (!clauseType || !deviationData?.items) return null;
+		const norm = (s: string) => (s || '').toLowerCase().trim();
+		const item = deviationData.items.find(
+			(it: any) => norm(it.clause_type) === norm(clauseType) && it.suggested_language_to_restore_standard
+		);
+		return item?.suggested_language_to_restore_standard || null;
+	}
+	async function copyStandardLanguage(text: string) {
+		try {
+			await navigator.clipboard.writeText(text);
+			toast.success('Standard language copied');
+		} catch {
+			toast.error('Copy failed');
+		}
+	}
+	function decisionBadgeClass(d: string): string {
+		return ({ ACCEPT: 'badge-success', REJECT: 'badge-danger', NEEDS_CHANGES: 'badge-warning', ACCEPTED_FALLBACK: 'badge-blue' } as Record<string, string>)[d] || 'badge-secondary';
+	}
+	async function decideDeviation(key: string, decision: string, clauseType?: string | null) {
+		decisionBusy = key;
+		try {
+			const res = await apiFetch(`/api/v1/contracts/${contractId}/deviations/${encodeURIComponent(key)}/decide`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ decision, clause_type: clauseType || null })
+			});
+			if (res.ok && contract) {
+				const data = await res.json();
+				const meta = { ...(contract.metadata_json || {}) };
+				meta.deviation_decisions = { ...(meta.deviation_decisions || {}), [key]: data.decision };
+				contract.metadata_json = meta;
+				toast.success(`Marked: ${decisionLabel(decision)}`);
+			} else {
+				toast.error('Could not save decision');
+			}
+		} catch {
+			toast.error('Could not save decision');
+		} finally {
+			decisionBusy = null;
+		}
+	}
+
+	// Lifecycle-stage-driven "what to do next" guidance (E5). Turns the workflow into in-product
+	// guidance rather than just a diagram. Stage comes from the workflow endpoint when loaded, else
+	// the contract's own lifecycle_stage column.
+	const cockpitStage = $derived(
+		workflowData?.current_stage ?? (contract as any)?.lifecycle_stage ?? contract?.metadata_json?.lifecycle_stage ?? null
+	);
+	const nextAction = $derived.by(() => {
+		const stage = cockpitStage;
+		if (!stage || contract?.status !== 'COMPLETED') return null;
+		const off = deviationData?.summary?.off_playbook ?? 0;
+		const hasParent = !!contract?.metadata_json?.parent_contract_id;
+		switch (stage) {
+			case 'DRAFT':
+				return { tone: 'info', title: 'Draft', detail: 'Review the AI analysis, then advance to internal review when ready.', cta: 'Open workflow', act: () => (activeTab = 'workflow') };
+			case 'INTERNAL_REVIEW':
+				return { tone: 'info', title: 'Internal review',
+					detail: off > 0 ? `Resolve ${off} off-standard clause${off === 1 ? '' : 's'}, then request approval to send to the supplier.` : 'No off-standard clauses flagged. Request approval to send to the supplier.',
+					cta: off > 0 ? 'Review deviations' : 'Open workflow', act: () => (activeTab = off > 0 ? 'deviation' : 'workflow') };
+			case 'SENT_TO_SUPPLIER':
+				return { tone: 'wait', title: 'Sent to supplier', detail: 'Awaiting the counterparty’s returned redlines. Upload their version when it arrives.', cta: 'Upload revision', act: () => (uploadRevisionModalOpen = true) };
+			case 'NEGOTIATION':
+				return { tone: 'info', title: 'In negotiation', detail: hasParent ? 'Review exactly what changed this round, then counter or advance.' : 'Review the deviations, then counter or advance the stage.', cta: hasParent ? 'Review changes' : 'Review deviations', act: () => (activeTab = hasParent ? 'verification' : 'deviation') };
+			case 'LEGAL_APPROVAL':
+				return { tone: 'warn', title: 'Legal approval', detail: 'Legal must approve before this can move to signature.', cta: 'Open workflow', act: () => (activeTab = 'workflow') };
+			case 'SIGNATURE':
+				return { tone: 'info', title: 'Signature', detail: 'Approved — ready for signature.', cta: 'Open workflow', act: () => (activeTab = 'workflow') };
+			case 'EXECUTED':
+			case 'ACTIVE':
+				return { tone: 'ok', title: 'Active', detail: 'Executed. Track obligations and renewal deadlines.', cta: 'View obligations', act: () => (activeTab = 'obligations') };
+			default:
+				return null; // EXPIRED / TERMINATED — no next action
+		}
+	});
 	const deviationStatus = $derived(contract?.metadata_json?.deviation_status || null);
 	const deviationItems = $derived(
 		((deviationData?.items || []) as any[]).filter((i) => i.deviation_type !== 'MATCHED')
@@ -995,8 +1152,12 @@
 
 		// Parse query parameters for deep linking
 		const params = new URL(window.location.href).searchParams;
-		const tabParam = params.get('tab');
+		let tabParam = params.get('tab');
+		// 'verification' folded into the unified Changes tab — keep old deep-links working.
+		if (tabParam === 'verification') { tabParam = 'changes'; changesSection = 'redlines'; }
 		if (tabParam) activeTab = VALID_TABS.includes(tabParam) ? tabParam : 'overview';
+		const sectionParam = params.get('section');
+		if (sectionParam === 'whatchanged' || sectionParam === 'redlines' || sectionParam === 'trend') changesSection = sectionParam;
 		const searchParam = params.get('search');
 		if (searchParam) clauseSearchQuery = searchParam;
 		const riskParam = params.get('risk');
@@ -1029,9 +1190,16 @@
 	});
 
 	$effect(() => {
-		if ((activeTab === 'workflow' || activeTab === 'history') && contract?.status === 'COMPLETED' && !workflowData && !workflowLoading) {
+		if ((activeTab === 'workflow' || activeTab === 'history' || activeTab === 'overview' || activeTab === 'changes') && contract?.status === 'COMPLETED' && !workflowData && !workflowLoading) {
 			loadWorkflow();
 		}
+	});
+
+	// Keep the active tab visible when the tab row scrolls horizontally (e.g. deep-linked to
+	// Workflow/History/Trace, or when the docked Assist widget narrows the panel).
+	$effect(() => {
+		const el = tabBarEl?.querySelector<HTMLElement>('.tab-btn.active');
+		if (el) el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
 	});
 
 	// Reactively start/stop the stopwatch based on processing status
@@ -1127,24 +1295,62 @@
 		</div>
 	</div>
 
+	{#snippet decisionBar(key: string, clauseType: string | null | undefined)}
+		{@const dec = deviationDecisions[key]}
+		<div class="decision-bar">
+			<span class="decision-label">Reviewer decision:</span>
+			<button type="button" class="decision-btn decision-accept" class:active={dec?.decision === 'ACCEPT'} disabled={decisionBusy === key} onclick={() => decideDeviation(key, 'ACCEPT', clauseType)}>Accept</button>
+			<button type="button" class="decision-btn decision-fallback" class:active={dec?.decision === 'ACCEPTED_FALLBACK'} disabled={decisionBusy === key} onclick={() => decideDeviation(key, 'ACCEPTED_FALLBACK', clauseType)}>Use our language</button>
+			<button type="button" class="decision-btn decision-reject" class:active={dec?.decision === 'REJECT'} disabled={decisionBusy === key} onclick={() => decideDeviation(key, 'REJECT', clauseType)}>Reject</button>
+			{#if dec}
+				<span class="decision-meta" title={dec.decided_at}>{decisionLabel(dec.decision)} · {dec.actor_email?.split('@')[0] || 'reviewer'}</span>
+			{/if}
+		</div>
+	{/snippet}
+
 	<div class="cockpit-wrapper">
 		<!-- Left Panel: Raw Document OCR Text -->
 		<div class="document-panel">
 			<div class="pane-header">
 				<div class="pane-title flex-row">
 					<svg class="file-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-					<span>Document OCR Text</span>
+					<span>{docView === 'original' && hasOriginalFile ? 'Original Document' : 'Document Text'}</span>
 				</div>
-				<div class="document-meta-info text-tertiary">
-					{#if contract.metadata_json?.raw_text}
-						{contract.metadata_json.raw_text.length.toLocaleString()} characters
-					{:else}
-						OCR Loading...
+				<div class="pane-header-right">
+					{#if hasOriginalFile}
+						<div class="doc-toggle" role="tablist" aria-label="Document view">
+							<button type="button" role="tab" aria-selected={docView === 'original'} class="doc-toggle-btn" class:active={docView === 'original'} onclick={() => (docView = 'original')}>Original</button>
+							<button type="button" role="tab" aria-selected={docView === 'text'} class="doc-toggle-btn" class:active={docView === 'text'} onclick={() => (docView = 'text')}>Text</button>
+						</div>
 					{/if}
+					<div class="document-meta-info text-tertiary">
+						{#if docView === 'original' && hasOriginalFile}
+							Original PDF
+						{:else if contract.metadata_json?.raw_text}
+							{contract.metadata_json.raw_text.length.toLocaleString()} characters{#if !hasOriginalFile} · <span title="The original file wasn't stored for this contract. Re-upload the PDF to view it here.">original not stored</span>{/if}
+						{:else}
+							OCR Loading...
+						{/if}
+					</div>
 				</div>
 			</div>
 			
 			<div class="document-body" id="document-body-container">
+				{#if docView === 'original' && hasOriginalFile}
+					{#if originalUrl}
+						<iframe class="pdf-frame" src={originalUrl} title="Original contract document"></iframe>
+					{:else if originalLoading}
+						<div class="document-placeholder">
+							<span class="spinner spinner-md"></span>
+							<p>Loading original document…</p>
+						</div>
+					{:else}
+						<div class="document-placeholder">
+							<p class="text-tertiary">Could not load the original document.</p>
+							<button type="button" class="btn btn-secondary btn-compact" onclick={() => (docView = 'text')}>Show extracted text</button>
+						</div>
+					{/if}
+				{:else}
 				{#if clauseMarkers.length > 0}
 					<div class="clause-minimap" aria-hidden="true">
 						{#each clauseMarkers as m (m.clauseId)}
@@ -1175,13 +1381,14 @@
 						</div>
 					{/if}
 				</div>
+				{/if}
 			</div>
 		</div>
 
 		<!-- Right Panel: AI Analysis panel -->
 		<div class="analysis-panel">
 			<!-- Sleek Tabs Navigation -->
-			<div class="analysis-tabs" role="tablist" aria-label="Contract Analysis Tabs">
+			<div class="analysis-tabs" role="tablist" aria-label="Contract Analysis Tabs" bind:this={tabBarEl}>
 				<button role="tab" aria-selected={activeTab === 'overview'} class="tab-btn" class:active={activeTab === 'overview'} onclick={() => activeTab = 'overview'}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
 					Overview
@@ -1200,9 +1407,12 @@
 						Obligations
 					</button>
 					{#if contract.metadata_json?.parent_contract_id}
-						<button role="tab" aria-selected={activeTab === 'verification'} class="tab-btn" class:active={activeTab === 'verification'} onclick={() => activeTab = 'verification'}>
+						<button role="tab" aria-selected={activeTab === 'changes'} class="tab-btn" class:active={activeTab === 'changes'} onclick={() => activeTab = 'changes'}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-							Redline Verification
+							Changes
+							{#if changeCount > 0}
+								<span class="badge badge-purple badge-sm" style="margin-left: 4px;">{changeCount}</span>
+							{/if}
 						</button>
 					{/if}
 					<button role="tab" aria-selected={activeTab === 'deviation'} class="tab-btn" class:active={activeTab === 'deviation'} onclick={() => activeTab = 'deviation'}>
@@ -1237,6 +1447,17 @@
 				<!-- OVERVIEW TAB -->
 				{#if activeTab === 'overview'}
 					<div class="tab-content flex-col">
+						{#if nextAction}
+							<div class="next-action next-action-{nextAction.tone}">
+								<div class="na-icon" aria-hidden="true">
+									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+								</div>
+								<div class="na-body">
+									<div class="na-title">{nextAction.title} · <span class="na-detail">{nextAction.detail}</span></div>
+								</div>
+								<button type="button" class="btn btn-primary btn-compact na-cta" onclick={nextAction.act}>{nextAction.cta}</button>
+							</div>
+						{/if}
 						<div class="overview-section">
 							<h3 class="subsection-title">Executive Summary</h3>
 							<div class="metadata-grid">
@@ -1767,12 +1988,59 @@
 				{/if}
 
 				<!-- REDLINE VERIFICATION TAB -->
-				{#if activeTab === 'verification' && contract.status === 'COMPLETED'}
+				{#if activeTab === 'changes' && contract.status === 'COMPLETED'}
 					{@const resolutions = contract.metadata_json?.redline_resolutions || []}
 					{@const resolvedCount = resolutions.filter((r: any) => r.status === 'RESOLVED').length}
 					{@const partialCount = resolutions.filter((r: any) => r.status === 'PARTIALLY_RESOLVED').length}
 					{@const unresolvedCount = resolutions.filter((r: any) => r.status === 'UNRESOLVED').length}
-					<div class="tab-content flex-col gap-24">
+					<div class="tab-content flex-col gap-16">
+						<div class="changes-subnav">
+							<button type="button" class="cs-tab" class:active={changesSection === 'whatchanged'} onclick={() => changesSection = 'whatchanged'}>What changed{#if changeCount > 0} · {changeCount}{/if}</button>
+							<button type="button" class="cs-tab" class:active={changesSection === 'redlines'} onclick={() => changesSection = 'redlines'}>Redline resolution{#if resolutions.length > 0} · {resolutions.length}{/if}</button>
+							<button type="button" class="cs-tab" class:active={changesSection === 'trend'} onclick={() => changesSection = 'trend'}>Deviation trend</button>
+						</div>
+
+						{#if changesSection === 'whatchanged'}
+							{#if versionChanges?.available}
+								<div class="wc-summary">
+									<span class="wc-stat wc-mod">{versionChanges.summary.modified} modified</span>
+									<span class="wc-stat wc-add">{versionChanges.summary.added} added</span>
+									<span class="wc-stat wc-rem">{versionChanges.summary.removed} removed</span>
+									<span class="wc-stat wc-unc">{versionChanges.summary.unchanged} unchanged</span>
+								</div>
+								<div class="wc-list flex-col gap-12">
+									{#each versionChanges.clauses.filter((c: any) => c.change_type !== 'UNCHANGED') as ch}
+										<div class="wc-card bg-panel-glow wc-{ch.change_type.toLowerCase()}">
+											<div class="wc-head">
+												<span class="wc-kind wc-kind-{ch.change_type.toLowerCase()}">{ch.change_type}</span>
+												<span class="clause-type-tag">{ch.clause_type || 'Clause'}</span>
+											</div>
+											{#if ch.change_type === 'MODIFIED' && ch.word_diff}
+												<div class="wc-diff"><WordDiff ops={ch.word_diff} /></div>
+												{@const stdLang = standardLanguageFor(ch.clause_type)}
+												{#if stdLang}
+													<button type="button" class="btn btn-secondary btn-compact wc-fallback-btn" onclick={() => copyStandardLanguage(stdLang)}>Use our standard language</button>
+												{/if}
+											{:else if ch.change_type === 'ADDED'}
+												<div class="wc-body wc-added-body"><ClampText text={ch.new_text} lines={4} /></div>
+											{:else if ch.change_type === 'REMOVED'}
+												<div class="wc-body wc-removed-body"><ClampText text={ch.prev_text} lines={4} /></div>
+											{/if}
+											{@render decisionBar('chg:' + (ch.new_clause_id || ch.prev_clause_id), ch.clause_type)}
+										</div>
+									{:else}
+										<div class="empty-state bg-panel-glow">
+											<p class="text-secondary">No clause-level changes were detected versus the previous version.</p>
+										</div>
+									{/each}
+								</div>
+							{:else}
+								<div class="empty-state bg-panel-glow">
+									<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+									<p class="text-secondary" style="margin-top: 8px;">A clause-by-clause comparison isn't available for this version{#if versionChanges?.reason === 'parent_not_analyzed'} — the previous version predates clause analysis{/if}. See Redline resolution for the AI audit of counterparty edits.</p>
+								</div>
+							{/if}
+						{:else if changesSection === 'redlines'}
 						<div class="verification-header bg-panel-glow">
 							<div class="vh-left">
 								<svg class="verify-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
@@ -1847,6 +2115,37 @@
 								</div>
 							{/each}
 						</div>
+						{:else if changesSection === 'trend'}
+							{@const versions = lineageData?.versions || []}
+							<div class="verification-header bg-panel-glow">
+								<div class="vh-left">
+									<svg class="verify-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><polyline points="7 14 11 10 14 13 20 7"/></svg>
+									<div>
+										<h3 class="subsection-title" style="margin: 0;">Deviation trend</h3>
+										<p class="text-tertiary font-size-12" style="margin: 4px 0 0 0;">How off-standard clauses and per-round changes evolved across the negotiation.</p>
+									</div>
+								</div>
+							</div>
+							{#if versions.length > 0}
+								<div class="trend-list flex-col gap-8">
+									{#each versions as v}
+										<div class="trend-row bg-panel-glow" class:current={v.is_current}>
+											<span class="badge {wfPhaseBadge(v.lifecycle_stage)} badge-sm">v{v.version_number}</span>
+											<span class="trend-party">{v.party === 'counterparty' ? 'Counterparty' : 'Our side'} · Round {v.round}</span>
+											<span class="trend-metrics">
+												{#if v.off_standard != null}<span class="trend-chip trend-off">{v.off_standard} off-standard</span>{/if}
+												{#if v.version_changed_clauses != null}<span class="trend-chip trend-chg">{v.version_changed_clauses} changed</span>{/if}
+											</span>
+											{#if !v.is_current}<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id)}>Open</button>{/if}
+										</div>
+									{/each}
+								</div>
+							{:else}
+								<div class="empty-state bg-panel-glow">
+									<p class="text-secondary">Version history isn't available yet.</p>
+								</div>
+							{/if}
+						{/if}
 					</div>
 				{/if}
 
@@ -1950,7 +2249,7 @@
 											<div class="pane pane-original">
 												<div class="pane-label">Our Standard</div>
 												{#if item.template_text}
-													<div class="pane-content" class:text-strikethrough={item.deviation_type === 'DELETED'}>{item.template_text}</div>
+													<div class="pane-content" class:text-strikethrough={item.deviation_type === 'DELETED'}><ClampText text={item.template_text} lines={4} /></div>
 												{:else}
 													<div class="dev-absent">Not in our standard template</div>
 												{/if}
@@ -1964,7 +2263,7 @@
 														<span class="dev-removed-sub">This protection no longer exists in the incoming contract.</span>
 													</div>
 												{:else}
-													<div class="pane-content highlight-revised">{item.contract_text}</div>
+													<div class="pane-content highlight-revised"><ClampText text={item.contract_text} lines={4} /></div>
 												{/if}
 											</div>
 										</div>
@@ -1981,19 +2280,20 @@
 													<span class="badge badge-success badge-sm">Favors us</span>
 												{/if}
 											</div>
-											<p class="ex-body">{item.rationale}</p>
+											<div class="ex-body"><ClampText text={item.rationale} lines={3} /></div>
 											{#if item.absolute_risk?.risk_reasoning}
 												<p class="ex-body text-tertiary" style="margin-top: 6px;">Standalone risk review: {item.absolute_risk.risk_reasoning}</p>
 											{/if}
 											{#if item.suggested_language_to_restore_standard}
 												<div class="redline-rec bg-hover" style="margin-top: 10px;">
 													<div class="rr-label">{item.deviation_type === 'DELETED' ? 'Re-insert standard language:' : 'Restore-to-standard language:'}</div>
-													<div class="rr-text">{item.suggested_language_to_restore_standard}</div>
+													<div class="rr-text"><ClampText text={item.suggested_language_to_restore_standard} lines={3} /></div>
 												</div>
 												<button type="button" class="btn btn-secondary btn-compact" style="margin-top: 8px;" onclick={() => copyRestoreLanguage(item)}>
 													Copy standard language
 												</button>
 											{/if}
+											{@render decisionBar('dev:' + di, item.clause_type)}
 										</div>
 									</div>
 								{:else}
@@ -2187,7 +2487,7 @@
 											<div class="hist-links">
 												<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id)}>Open</button>
 												{#if v.changed_clauses > 0}
-													<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id + '?tab=verification')}>View redlines</button>
+													<button type="button" class="hist-link" onclick={() => goto('/contracts/' + v.id + '?tab=changes')}>View changes</button>
 												{/if}
 											</div>
 										</div>
@@ -2198,6 +2498,28 @@
 					</div>
 				{/if}
 			</div>
+			{#if contract.status === 'COMPLETED'}
+				<div class="risk-legend" class:open={riskLegendOpen}>
+					<button type="button" class="risk-legend-toggle" onclick={() => (riskLegendOpen = !riskLegendOpen)} aria-expanded={riskLegendOpen}>
+						<span class="rl-chips" aria-hidden="true">
+							<span class="rl-chip rl-low">Low</span>
+							<span class="rl-chip rl-medium">Medium</span>
+							<span class="rl-chip rl-high">High</span>
+							<span class="rl-chip rl-critical">Critical</span>
+						</span>
+						<span class="rl-title">How risk is scored</span>
+						<svg class="rl-caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+					</button>
+					{#if riskLegendOpen}
+						<div class="risk-legend-body">
+							<p>Each clause is reviewed by an AI legal-counsel model that scores <strong>7 risk dimensions</strong> — termination, payment, liability, indemnification, IP, confidentiality and dispute resolution — from 0 to 1, plus a <strong>confidence</strong> score.</p>
+							<p>The <strong>Low / Medium / High / Critical</strong> level is the model's direct legal judgment, <strong>not</strong> a numeric threshold. The <strong>composite score</strong> shown in a clause's technical details is simply the single highest dimension, provided for transparency.</p>
+							<p>A deviation's <strong>“risk of change”</strong> measures the <em>added</em> risk a counterparty's edit introduces versus our standard language — not the clause's absolute risk.</p>
+							<p class="rl-fine">If the AI model is unavailable, a keyword heuristic estimates the level (flagged as a fallback); broad IP-assignment grants are always raised to at least High.</p>
+						</div>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	</div>
 {/if}
@@ -2506,7 +2828,10 @@
 	/* Main Split Screen Wrapper */
 	.cockpit-wrapper {
 		display: grid;
-		grid-template-columns: minmax(520px, 58%) minmax(420px, 42%);
+		/* Left column min is 0 so the document panel shrinks (its body scrolls) instead of
+		   pushing the analysis panel — and its tab row — off-screen when the docked Assist
+		   widget reserves 400px on the right. */
+		grid-template-columns: minmax(0, 58%) minmax(360px, 42%);
 		height: calc(100vh - 68px);
 		background: var(--bg-app);
 		overflow: hidden;
@@ -2554,6 +2879,41 @@
 
 	.document-meta-info {
 		font-size: 12px;
+	}
+
+	/* Original PDF vs annotated text toggle */
+	.pane-header-right {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		min-width: 0;
+	}
+	.doc-toggle {
+		display: flex;
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-pill, 980px);
+		overflow: hidden;
+		flex-shrink: 0;
+	}
+	.doc-toggle-btn {
+		border: none;
+		background: transparent;
+		color: var(--text-secondary);
+		font-size: 11px;
+		font-weight: 600;
+		padding: 3px 12px;
+		cursor: pointer;
+		transition: color 120ms var(--ease-out), background 120ms var(--ease-out);
+	}
+	.doc-toggle-btn:hover { color: var(--text-primary); }
+	.doc-toggle-btn.active { background: var(--brand-primary, #0071e3); color: #fff; }
+	.pdf-frame {
+		width: 100%;
+		height: 100%;
+		min-height: 600px;
+		border: 1px solid var(--border-subtle);
+		border-radius: 8px;
+		background: #fff;
 	}
 
 	.document-body {
@@ -2653,6 +3013,19 @@
 		height: 48px;
 		flex-shrink: 0;
 		align-items: center;
+		/* Tabs scroll horizontally rather than clip — so Workflow/History/Trace stay
+		   reachable even when the docked Assist widget narrows the panel. Scrollbar hidden
+		   (matches .pill-nav); the right-edge fade hints there's more to scroll. */
+		flex-wrap: nowrap;
+		overflow-x: auto;
+		overflow-y: hidden;
+		scrollbar-width: none;
+		-webkit-overflow-scrolling: touch;
+		-webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
+		mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent 100%);
+	}
+	.analysis-tabs::-webkit-scrollbar {
+		display: none;
 	}
 
 	.tab-btn {
@@ -2669,6 +3042,8 @@
 		align-items: center;
 		gap: 6px;
 		user-select: none;
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.tab-btn:hover {
@@ -2690,6 +3065,185 @@
 		flex: 1;
 		overflow-y: auto;
 		background: var(--bg-app);
+	}
+
+	/* Per-deviation reviewer decisions (Slice 5) */
+	.decision-bar {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+		margin-top: 12px;
+		padding-top: 10px;
+		border-top: 1px dashed var(--border-subtle);
+	}
+	.decision-label { font-size: 11px; font-weight: 600; color: var(--text-tertiary); margin-right: 2px; }
+	.decision-btn {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 3px 10px;
+		border-radius: var(--radius-pill, 980px);
+		border: 1px solid var(--border-subtle);
+		background: transparent;
+		color: var(--text-secondary);
+		cursor: pointer;
+		transition: color 120ms var(--ease-out), background 120ms var(--ease-out), border-color 120ms var(--ease-out);
+	}
+	.decision-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+	.decision-btn:disabled { opacity: 0.5; cursor: default; }
+	.decision-btn.decision-accept.active { background: var(--color-low, #22c55e); border-color: transparent; color: #fff; }
+	.decision-btn.decision-fallback.active { background: var(--brand-primary, #0071e3); border-color: transparent; color: #fff; }
+	.decision-btn.decision-reject.active { background: var(--color-high, #ef4444); border-color: transparent; color: #fff; }
+	.decision-meta { font-size: 11px; color: var(--text-tertiary); margin-left: auto; }
+
+	/* Unified Changes tab (Slice 3) */
+	.changes-subnav {
+		display: flex;
+		gap: 6px;
+		position: sticky;
+		top: 0;
+		z-index: 2;
+		padding-bottom: 8px;
+		background: var(--bg-app);
+	}
+	.cs-tab {
+		background: transparent;
+		border: 1px solid var(--border-subtle);
+		color: var(--text-secondary);
+		padding: 5px 12px;
+		border-radius: var(--radius-pill, 980px);
+		font-size: 12px;
+		font-weight: 600;
+		cursor: pointer;
+		transition: color 120ms var(--ease-out), background 120ms var(--ease-out), border-color 120ms var(--ease-out);
+		white-space: nowrap;
+	}
+	.cs-tab:hover { color: var(--text-primary); background: var(--bg-hover); }
+	.cs-tab.active { color: #fff; background: var(--brand-primary, #0071e3); border-color: transparent; }
+	.wc-summary {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		font-size: 11px;
+		font-weight: 600;
+	}
+	.wc-stat { padding: 2px 9px; border-radius: 999px; }
+	.wc-stat.wc-mod { color: var(--color-medium); background: color-mix(in srgb, var(--color-medium) 14%, transparent); }
+	.wc-stat.wc-add { color: var(--color-low-text, #15803d); background: color-mix(in srgb, var(--color-low, #22c55e) 16%, transparent); }
+	.wc-stat.wc-rem { color: var(--color-high-text, #b91c1c); background: color-mix(in srgb, var(--color-high, #ef4444) 14%, transparent); }
+	.wc-stat.wc-unc { color: var(--text-tertiary); background: var(--bg-hover); }
+	.wc-card { padding: 12px 14px; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); }
+	.wc-card.wc-modified { border-left: 3px solid var(--color-medium); }
+	.wc-card.wc-added { border-left: 3px solid var(--color-low, #22c55e); }
+	.wc-card.wc-removed { border-left: 3px solid var(--color-high, #ef4444); }
+	.wc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+	.wc-kind { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 1px 7px; border-radius: 4px; color: #fff; }
+	.wc-kind-modified { background: var(--color-medium); }
+	.wc-kind-added { background: var(--color-low, #22c55e); }
+	.wc-kind-removed { background: var(--color-high, #ef4444); }
+	.wc-body { font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
+	.wc-removed-body { text-decoration: line-through; opacity: 0.75; }
+	.wc-fallback-btn { margin-top: 8px; }
+	.trend-list { }
+	.trend-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 8px 12px;
+		border-radius: var(--radius-md);
+		border: 1px solid var(--border-subtle);
+	}
+	.trend-row.current { border-color: var(--brand-primary, #0071e3); }
+	.trend-party { font-size: 12px; color: var(--text-secondary); flex-shrink: 0; }
+	.trend-metrics { display: flex; gap: 6px; margin-left: auto; }
+	.trend-chip { font-size: 10px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
+	.trend-chip.trend-off { color: var(--color-high-text, #b91c1c); background: color-mix(in srgb, var(--color-high, #ef4444) 12%, transparent); }
+	.trend-chip.trend-chg { color: var(--text-secondary); background: var(--bg-hover); }
+
+	/* Lifecycle next-action banner (E5) */
+	.next-action {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 12px 14px;
+		border-radius: var(--radius-md);
+		border: 1px solid var(--border-subtle);
+		background: var(--bg-panel-glow, var(--bg-sidebar));
+		margin-bottom: 4px;
+	}
+	.next-action .na-icon {
+		flex-shrink: 0;
+		width: 30px;
+		height: 30px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 999px;
+		color: #fff;
+		background: var(--color-medium);
+	}
+	.next-action-info .na-icon { background: var(--brand-primary, #0071e3); }
+	.next-action-warn .na-icon { background: var(--color-high); }
+	.next-action-wait .na-icon { background: var(--color-medium); }
+	.next-action-ok .na-icon { background: var(--color-low); }
+	.next-action .na-body { flex: 1; min-width: 0; }
+	.next-action .na-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+	.next-action .na-detail { font-weight: 400; color: var(--text-secondary); }
+	.next-action .na-cta { flex-shrink: 0; }
+	.next-action-info { border-left: 3px solid var(--brand-primary, #0071e3); }
+	.next-action-warn { border-left: 3px solid var(--color-high); }
+	.next-action-wait { border-left: 3px solid var(--color-medium); }
+	.next-action-ok { border-left: 3px solid var(--color-low); }
+
+	/* Risk-methodology footer legend (E4) — pinned below the scroll region */
+	.risk-legend {
+		flex-shrink: 0;
+		border-top: 1px solid var(--border-subtle);
+		background: var(--bg-sidebar);
+	}
+	.risk-legend-toggle {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 16px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--text-secondary);
+	}
+	.risk-legend-toggle:hover { background: var(--bg-hover); }
+	.rl-chips { display: flex; gap: 4px; }
+	.rl-chip {
+		font-size: 10px;
+		font-weight: 600;
+		padding: 1px 7px;
+		border-radius: 999px;
+		color: #fff;
+		line-height: 1.6;
+	}
+	.rl-chip.rl-low { background: var(--color-low); }
+	.rl-chip.rl-medium { background: var(--color-medium); }
+	.rl-chip.rl-high { background: var(--color-high); }
+	.rl-chip.rl-critical { background: var(--color-critical); }
+	.rl-title { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+	.rl-caret { margin-left: auto; transition: transform 180ms var(--ease-out); }
+	.risk-legend.open .rl-caret { transform: rotate(180deg); }
+	.risk-legend-body {
+		padding: 4px 16px 14px;
+		max-height: 40vh;
+		overflow-y: auto;
+	}
+	.risk-legend-body p {
+		font-size: 12px;
+		line-height: 1.55;
+		color: var(--text-secondary);
+		margin: 6px 0;
+	}
+	.risk-legend-body strong { color: var(--text-primary); font-weight: 600; }
+	.risk-legend-body .rl-fine { font-size: 11px; color: var(--text-tertiary); }
+	@media (prefers-reduced-motion: reduce) {
+		.rl-caret { transition: none; }
 	}
 
 	.tab-content {
